@@ -1,0 +1,6 @@
+@OrgMind.API_HostAddress = http://localhost:5147
+
+GET {{OrgMind.API_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

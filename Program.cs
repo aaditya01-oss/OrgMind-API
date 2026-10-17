@@ -1,10 +1,17 @@
 using OrgMind.API.Services;
 using OrgMind.API.Models;
-
+using OrgMind.API.Data;
+using Npgsql.EntityFrameworkCore.PostgreSQL;
+using Microsoft.EntityFrameworkCore;
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddHttpClient<IChatService, ChatService>();
+builder.Services.AddDbContext<OrgMindDbContext>(options =>
+    options.UseNpgsql(
+        builder.Configuration.GetConnectionString("DefaultConnection"),
+        b => b.MigrationsAssembly("OrgMind.API")
+    ));
 
 var app = builder.Build();
 

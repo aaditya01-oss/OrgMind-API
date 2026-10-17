@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("OrgMind.API")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+5f81b697d31e745b0595773cc5d8d67575c19f69")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+9811dd7d7148a7bcbc59a672fd44779f6ad22a6e")]
 [assembly: System.Reflection.AssemblyProductAttribute("OrgMind.API")]
 [assembly: System.Reflection.AssemblyTitleAttribute("OrgMind.API")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

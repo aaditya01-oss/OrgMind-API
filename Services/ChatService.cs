@@ -17,36 +17,31 @@ public class ChatService : IChatService
         _model = configuration["GroqModel"] ?? "openai/gpt-oss-20b";
     }
 
-    public async Task<string> ChatAsync(string userMessage, string userId, string orgId, string orgName)
+ public async Task<string> ChatAsync(string userMessage, string userId, string orgId, string orgName)
+ {
+    var requestBody = new
     {
-        var requestBody = new
-        {
-            model = _model,
-            messages = new[]
-            {
-                new { role = "system", content = $"You are OrgBot, an intelligent assistant for {orgName}." },
-                new { role = "user", content = userMessage }
-            }
-        };
+        user_message = userMessage,
+        user_id = userId,
+        org_id = orgId,
+        org_name = orgName
+    };
 
-        var json = JsonSerializer.Serialize(requestBody);
-        var content = new StringContent(json, Encoding.UTF8, "application/json");
+    var json = JsonSerializer.Serialize(requestBody);
+    var content = new StringContent(json, Encoding.UTF8, "application/json");
 
-        _httpClient.DefaultRequestHeaders.Clear();
-        _httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {_apiKey}");
+    _httpClient.DefaultRequestHeaders.Clear();
 
-        var response = await _httpClient.PostAsync(
-            "https://api.groq.com/openai/v1/chat/completions",
-            content
-        );
+    var response = await _httpClient.PostAsync(
+        "http://localhost:8000/agent/chat",
+        content
+    );
 
-        var responseJson = await response.Content.ReadAsStringAsync();
-        var parsed = JsonDocument.Parse(responseJson);
-        
-        return parsed.RootElement
-            .GetProperty("choices")[0]
-            .GetProperty("message")
-            .GetProperty("content")
-            .GetString() ?? "No response";
-    }
+    var responseJson = await response.Content.ReadAsStringAsync();
+    var parsed = JsonDocument.Parse(responseJson);
+
+    return parsed.RootElement
+        .GetProperty("response")
+        .GetString() ?? "No response";
+}
 }

@@ -50,9 +50,10 @@ public class AuthService : IAuthService
 
     private string GenerateJwtToken(User user)
     {
-        var key = new SymmetricSecurityKey(
-            Encoding.UTF8.GetBytes(_configuration["JwtSecret"] ?? "default-secret-key")
-        );
+        var secret = _configuration["JwtSecret"]
+            ?? throw new InvalidOperationException("JwtSecret is not configured.");
+
+        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secret));
 
         var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
 

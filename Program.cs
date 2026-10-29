@@ -6,6 +6,8 @@ using Microsoft.IdentityModel.Tokens;
 using OrgMind.API.Data;
 using OrgMind.API.Models;
 using OrgMind.API.Services;
+using System.Threading.RateLimiting;
+using Microsoft.AspNetCore.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -23,6 +25,7 @@ builder.Services.AddDbContext<OrgMindDbContext>(options =>
         builder.Configuration.GetConnectionString("DefaultConnection"),
         b => b.MigrationsAssembly("OrgMind.API")
     ));
+
 
 builder.Services
     .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
@@ -53,12 +56,41 @@ builder.Services.AddCors(options =>
     });
 });
 
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+    // Login and registration: limited per client IP address
+    options.AddPolicy("auth", httpContext =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 10,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0
+            }));
+
+    // Chat and uploads: limited per signed-in user
+    options.AddPolicy("user", httpContext =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            httpContext.User.FindFirst("email")?.Value
+                ?? httpContext.Connection.RemoteIpAddress?.ToString()
+                ?? "unknown",
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 20,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0
+            }));
+});
 var app = builder.Build();
 
 app.UseHttpsRedirection();
 app.UseCors("OrgMindPolicy");
 app.UseAuthentication();
 app.UseAuthorization();
+app.UseRateLimiter();
 
 app.MapGet("/", () => "OrgMind API is running!");
 
@@ -86,26 +118,53 @@ app.MapPost("/chat", async (ChatRequest request, ClaimsPrincipal user, IChatServ
         UserId = email,
         OrgId = orgId
     });
-}).RequireAuthorization();
+}).RequireAuthorization().RequireRateLimiting("user");
 
 app.MapPost("/auth/register", async (RegisterRequest request, IAuthService authService) =>
 {
-    var token = await authService.RegisterAsync(request.Email, request.Password, request.OrgId);
-    return Results.Ok(new AuthResponse
-    {
-        Token = token,
-        Email = request.Email,
-        OrgId = request.OrgId,
-        Role = "member"
-    });
-});
+    var result = await authService.RegisterWithInviteAsync(request.Email, request.Password, request.InviteCode);
+    return result.Success
+        ? Results.Ok(new AuthResponse
+        {
+            Token = result.Token!,
+            Email = request.Email.Trim().ToLowerInvariant(),
+            OrgId = result.OrgId!,
+            Role = result.Role!
+        })
+        : Results.BadRequest(new { error = result.Error });
+}).RequireRateLimiting("auth");
+
+app.MapPost("/auth/register-org", async (CreateOrgRequest request, IAuthService authService) =>
+{
+    var result = await authService.CreateOrganizationAsync(request.Email, request.Password, request.OrgName);
+    return result.Success
+        ? Results.Ok(new AuthResponse
+        {
+            Token = result.Token!,
+            Email = request.Email.Trim().ToLowerInvariant(),
+            OrgId = result.OrgId!,
+            Role = result.Role!
+        })
+        : Results.BadRequest(new { error = result.Error });
+}).RequireRateLimiting("auth");
+
+app.MapPost("/orgs/invites", async (CreateInviteRequest request, ClaimsPrincipal user, IAuthService authService) =>
+{
+    var orgId = user.FindFirst("orgId")?.Value;
+    var email = user.FindFirst("email")?.Value;
+    if (orgId is null || email is null) return Results.Unauthorized();
+
+    var role = request.Role == "admin" ? "admin" : "member";
+    var (code, expiresAt) = await authService.CreateInviteAsync(orgId, role, email);
+    return Results.Ok(new { code, expiresAt });
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
 
 app.MapPost("/auth/login", async (LoginRequest request, IAuthService authService) =>
 {
     var token = await authService.LoginAsync(request.Email, request.Password);
     if (token == null) return Results.Unauthorized();
     return Results.Ok(new { token });
-});
+}).RequireRateLimiting("auth");
 
 const long MaxUploadBytes = 20 * 1024 * 1024;
 
@@ -138,10 +197,10 @@ async Task<IResult> HandleUpload(HttpRequest http, ClaimsPrincipal user, IDocume
 
 app.MapPost("/documents/train", (HttpRequest http, ClaimsPrincipal user, IDocumentService docs) =>
     HandleUpload(http, user, docs, "/documents/train", new[] { ".pdf", ".docx", ".txt" }))
-    .RequireAuthorization();
+    .RequireAuthorization().RequireRateLimiting("user");
 
 app.MapPost("/documents/ocr", (HttpRequest http, ClaimsPrincipal user, IDocumentService docs) =>
     HandleUpload(http, user, docs, "/documents/ocr", new[] { ".pdf", ".png", ".jpg", ".jpeg" }))
-    .RequireAuthorization();
+    .RequireAuthorization().RequireRateLimiting("user");
 
 app.Run();

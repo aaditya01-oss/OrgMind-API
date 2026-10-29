@@ -170,9 +170,10 @@ const long MaxUploadBytes = 20 * 1024 * 1024;
 
 async Task<IResult> HandleUpload(HttpRequest http, ClaimsPrincipal user, IDocumentService docs, string route, string[] allowed)
 {
-    // org_id comes from the verified token, never from the browser.
+        // Identity comes from the verified token, never from the browser.
     var orgId = user.FindFirst("orgId")?.Value;
-    if (string.IsNullOrEmpty(orgId)) return Results.Unauthorized();
+    var email = user.FindFirst("email")?.Value;
+    if (string.IsNullOrEmpty(orgId) || string.IsNullOrEmpty(email)) return Results.Unauthorized();
 
     if (!http.HasFormContentType)
         return Results.BadRequest(new { error = "Expected multipart/form-data." });
@@ -187,7 +188,7 @@ async Task<IResult> HandleUpload(HttpRequest http, ClaimsPrincipal user, IDocume
         return Results.BadRequest(new { error = $"Allowed types: {string.Join(", ", allowed)}" });
 
     var docName = Path.GetFileName(file.FileName);
-    var (status, body) = await docs.ForwardAsync(route, file, orgId, docName);
+    var (status, body) = await docs.ForwardAsync(route, file, orgId, email, docName);
 
     if (status < 200 || status >= 300)
         return Results.Problem("The document service could not process this file.", statusCode: 502);

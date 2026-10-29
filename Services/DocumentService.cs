@@ -2,7 +2,7 @@ namespace OrgMind.API.Services;
 
 public interface IDocumentService
 {
-    Task<(int Status, string Body)> ForwardAsync(string route, IFormFile file, string orgId, string docName);
+    Task<(int Status, string Body)> ForwardAsync(string route, IFormFile file, string orgId, string userId, string docName);
 }
 
 public class DocumentService : IDocumentService
@@ -20,13 +20,14 @@ public class DocumentService : IDocumentService
         _http.Timeout = TimeSpan.FromMinutes(5);
     }
 
-    public async Task<(int Status, string Body)> ForwardAsync(string route, IFormFile file, string orgId, string docName)
+    public async Task<(int Status, string Body)> ForwardAsync(string route, IFormFile file, string orgId, string userId, string docName)
     {
         using var form = new MultipartFormDataContent();
         await using var stream = file.OpenReadStream();
         form.Add(new StreamContent(stream), "file", file.FileName);
         form.Add(new StringContent(orgId), "org_id");
         form.Add(new StringContent(docName), "doc_name");
+        form.Add(new StringContent(userId), "user_id");
 
         using var httpRequest = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}{route}") { Content = form };
         httpRequest.Headers.Add("X-Internal-Key", _internalKey);

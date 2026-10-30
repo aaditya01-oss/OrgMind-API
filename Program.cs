@@ -8,6 +8,7 @@ using OrgMind.API.Models;
 using OrgMind.API.Services;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.RateLimiting;
+using System.IdentityModel.Tokens.Jwt;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -20,6 +21,8 @@ builder.Services.AddHttpClient<IChatService, ChatService>();
 builder.Services.AddHttpClient<IDocumentService, DocumentService>();
 builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 25 * 1024 * 1024);
 builder.Services.AddScoped<IAuthService, AuthService>();
+builder.Services.AddSingleton<IAuditService, AuditService>();
+
 builder.Services.AddDbContext<OrgMindDbContext>(options =>
     options.UseNpgsql(
         builder.Configuration.GetConnectionString("DefaultConnection"),
@@ -120,35 +123,41 @@ app.MapPost("/chat", async (ChatRequest request, ClaimsPrincipal user, IChatServ
     });
 }).RequireAuthorization().RequireRateLimiting("user");
 
-app.MapPost("/auth/register", async (RegisterRequest request, IAuthService authService) =>
+app.MapPost("/auth/register", async (RegisterRequest request, IAuthService authService, IAuditService audit, HttpContext http) =>
 {
-    var result = await authService.RegisterWithInviteAsync(request.Email, request.Password, request.InviteCode);
-    return result.Success
-        ? Results.Ok(new AuthResponse
-        {
-            Token = result.Token!,
-            Email = request.Email.Trim().ToLowerInvariant(),
-            OrgId = result.OrgId!,
-            Role = result.Role!
-        })
-        : Results.BadRequest(new { error = result.Error });
+    var ip = http.Connection.RemoteIpAddress?.ToString();
+        var emailInput = request.Email ?? "";
+    var email = emailInput.Trim().ToLowerInvariant();
+    var result = await authService.RegisterWithInviteAsync(emailInput, request.Password ?? "", request.InviteCode ?? "");
+
+    if (!result.Success)
+    {
+        await audit.LogAsync("REGISTER_FAILED", email, null, new { reason = result.Error, method = "invite", ip }, "WARNING");
+        return Results.BadRequest(new { error = result.Error });
+    }
+
+    await audit.LogAsync("USER_JOINED", email, result.OrgId, new { role = result.Role, ip });
+    return Results.Ok(new AuthResponse { Token = result.Token!, Email = email, OrgId = result.OrgId!, Role = result.Role! });
 }).RequireRateLimiting("auth");
 
-app.MapPost("/auth/register-org", async (CreateOrgRequest request, IAuthService authService) =>
+app.MapPost("/auth/register-org", async (CreateOrgRequest request, IAuthService authService, IAuditService audit, HttpContext http) =>
 {
-    var result = await authService.CreateOrganizationAsync(request.Email, request.Password, request.OrgName);
-    return result.Success
-        ? Results.Ok(new AuthResponse
-        {
-            Token = result.Token!,
-            Email = request.Email.Trim().ToLowerInvariant(),
-            OrgId = result.OrgId!,
-            Role = result.Role!
-        })
-        : Results.BadRequest(new { error = result.Error });
+    var ip = http.Connection.RemoteIpAddress?.ToString();
+    var emailInput = request.Email ?? "";
+    var email = emailInput.Trim().ToLowerInvariant();
+    var result = await authService.CreateOrganizationAsync(emailInput, request.Password ?? "", request.OrgName ?? "");
+
+    if (!result.Success)
+    {
+        await audit.LogAsync("REGISTER_FAILED", email, null, new { reason = result.Error, method = "create_org", ip }, "WARNING");
+        return Results.BadRequest(new { error = result.Error });
+    }
+
+    await audit.LogAsync("ORG_CREATED", email, result.OrgId, new { orgName = request.OrgName, ip });
+    return Results.Ok(new AuthResponse { Token = result.Token!, Email = email, OrgId = result.OrgId!, Role = result.Role! });
 }).RequireRateLimiting("auth");
 
-app.MapPost("/orgs/invites", async (CreateInviteRequest request, ClaimsPrincipal user, IAuthService authService) =>
+app.MapPost("/orgs/invites", async (CreateInviteRequest request, ClaimsPrincipal user, IAuthService authService, IAuditService audit) =>
 {
     var orgId = user.FindFirst("orgId")?.Value;
     var email = user.FindFirst("email")?.Value;
@@ -156,16 +165,29 @@ app.MapPost("/orgs/invites", async (CreateInviteRequest request, ClaimsPrincipal
 
     var role = request.Role == "admin" ? "admin" : "member";
     var (code, expiresAt) = await authService.CreateInviteAsync(orgId, role, email);
+
+    // Log that an invite was made, but never the code itself: it is a secret.
+    await audit.LogAsync("INVITE_CREATED", email, orgId, new { role, expiresAt });
     return Results.Ok(new { code, expiresAt });
 }).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
 
-app.MapPost("/auth/login", async (LoginRequest request, IAuthService authService) =>
+app.MapPost("/auth/login", async (LoginRequest request, IAuthService authService, IAuditService audit, HttpContext http) =>
 {
-    var token = await authService.LoginAsync(request.Email, request.Password);
-    if (token == null) return Results.Unauthorized();
+    var ip = http.Connection.RemoteIpAddress?.ToString();
+        var emailInput = request.Email ?? "";
+    var email = emailInput.Trim().ToLowerInvariant();
+    var token = await authService.LoginAsync(emailInput, request.Password ?? "");
+
+    if (token == null)
+    {
+        await audit.LogAsync("LOGIN_FAILED", email, null, new { ip }, "WARNING");
+        return Results.Unauthorized();
+    }
+
+    var orgId = new JwtSecurityTokenHandler().ReadJwtToken(token).Claims.FirstOrDefault(c => c.Type == "orgId")?.Value;
+    await audit.LogAsync("LOGIN_SUCCESS", email, orgId, new { ip });
     return Results.Ok(new { token });
 }).RequireRateLimiting("auth");
-
 const long MaxUploadBytes = 20 * 1024 * 1024;
 
 async Task<IResult> HandleUpload(HttpRequest http, ClaimsPrincipal user, IDocumentService docs, string route, string[] allowed)
@@ -189,6 +211,21 @@ async Task<IResult> HandleUpload(HttpRequest http, ClaimsPrincipal user, IDocume
 
     var docName = Path.GetFileName(file.FileName);
     var (status, body) = await docs.ForwardAsync(route, file, orgId, email, docName);
+
+        // 422 = the file itself is the problem (e.g. a scan with no text). That message was
+    // written to be shown to users, so we pass it on.
+    if (status == 422)
+    {
+        var message = "This file could not be processed.";
+        try
+        {
+            using var json = System.Text.Json.JsonDocument.Parse(body);
+            if (json.RootElement.TryGetProperty("detail", out var d) && d.ValueKind == System.Text.Json.JsonValueKind.String)
+                message = d.GetString() ?? message;
+        }
+        catch (System.Text.Json.JsonException) { }
+        return Results.Json(new { error = message }, statusCode: 422);
+    }
 
     if (status < 200 || status >= 300)
         return Results.Problem("The document service could not process this file.", statusCode: 502);

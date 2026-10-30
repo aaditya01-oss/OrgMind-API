@@ -14,6 +14,7 @@ public class OrgMindDbContext : DbContext
     public DbSet<User> Users { get; set; }
     public DbSet<Organization> Organizations { get; set; }
     public DbSet<Invite> Invites { get; set; }
+    public DbSet<AuditLog> AuditLogs { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -62,6 +63,19 @@ modelBuilder.Entity<Invite>(entity =>
     entity.Property(e => e.UsedAt).HasColumnName("used_at");
     entity.Property(e => e.CreatedBy).HasColumnName("created_by");
     entity.Property(e => e.CreatedAt).HasColumnName("created_at");
+});
+modelBuilder.Entity<AuditLog>(entity =>
+{
+    entity.ToTable("audit_logs");
+    entity.HasKey(e => e.Id);
+    entity.Property(e => e.Id).HasColumnName("id");
+    entity.Property(e => e.EventType).HasColumnName("event_type");
+    entity.Property(e => e.UserId).HasColumnName("user_id");
+    entity.Property(e => e.OrgId).HasColumnName("org_id");
+    entity.Property(e => e.Details).HasColumnName("details").HasColumnType("jsonb");
+    entity.Property(e => e.Severity).HasColumnName("severity");
+    entity.Property(e => e.Timestamp).HasColumnName("timestamp")
+          .HasDefaultValueSql("CURRENT_TIMESTAMP").ValueGeneratedOnAdd();
 });
     }
 }

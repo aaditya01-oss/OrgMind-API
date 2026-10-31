@@ -18,7 +18,7 @@ public class ChatService : IChatService
         _httpClient.Timeout = TimeSpan.FromMinutes(2);
     }
 
-    public async Task<string> ChatAsync(string userMessage, string userId, string orgId, string orgName)
+        public async Task<ChatResult> ChatAsync(string userMessage, string userId, string orgId, string orgName)
     {
         var json = JsonSerializer.Serialize(new
         {
@@ -38,7 +38,19 @@ public class ChatService : IChatService
         response.EnsureSuccessStatusCode();
 
         var responseJson = await response.Content.ReadAsStringAsync();
-        using var parsed = JsonDocument.Parse(responseJson);
-        return parsed.RootElement.GetProperty("response").GetString() ?? "No response";
+                using var parsed = JsonDocument.Parse(responseJson);
+        var root = parsed.RootElement;
+
+        var text = root.GetProperty("response").GetString() ?? "No response";
+        var sources = new List<string>();
+        if (root.TryGetProperty("sources", out var arr) && arr.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in arr.EnumerateArray())
+            {
+                var name = item.GetString();
+                if (!string.IsNullOrWhiteSpace(name)) sources.Add(name);
+            }
+        }
+        return new ChatResult(text, sources);
     }
 }

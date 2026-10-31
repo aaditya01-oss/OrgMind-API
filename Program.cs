@@ -113,13 +113,14 @@ app.MapPost("/chat", async (ChatRequest request, ClaimsPrincipal user, IChatServ
     if (string.IsNullOrEmpty(orgId) || string.IsNullOrEmpty(email))
         return Results.Unauthorized();
 
-    var response = await chatService.ChatAsync(request.UserMessage, email, orgId, request.OrgName);
+        var result = await chatService.ChatAsync(request.UserMessage, email, orgId, request.OrgName);
 
-    return Results.Ok(new ChatResponse
+    return Results.Ok(new
     {
-        Response = response,
-        UserId = email,
-        OrgId = orgId
+        response = result.Response,
+        userId = email,
+        orgId,
+        sources = result.Sources
     });
 }).RequireAuthorization().RequireRateLimiting("user");
 

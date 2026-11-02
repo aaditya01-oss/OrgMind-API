@@ -18,14 +18,16 @@ public class ChatService : IChatService
         _httpClient.Timeout = TimeSpan.FromMinutes(2);
     }
 
-        public async Task<ChatResult> ChatAsync(string userMessage, string userId, string orgId, string orgName)
+        public async Task<ChatResult> ChatAsync(string userMessage, string userId, string orgId, string orgName, string role, string? department)
     {
-        var json = JsonSerializer.Serialize(new
+            var json = JsonSerializer.Serialize(new
         {
             user_message = userMessage,
             user_id = userId,
             org_id = orgId,
-            org_name = orgName
+            org_name = orgName,
+            role = role,
+            department = department
         });
 
         using var httpRequest = new HttpRequestMessage(HttpMethod.Post, $"{_baseUrl}/agent/chat")

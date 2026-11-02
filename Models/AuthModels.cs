@@ -17,6 +17,7 @@ public class CreateOrgRequest
 public class CreateInviteRequest
 {
     public string Role { get; set; } = "member";
+    public string? Department { get; set; }
 }
 
 public class LoginRequest

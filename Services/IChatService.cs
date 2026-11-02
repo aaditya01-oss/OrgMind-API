@@ -4,5 +4,5 @@ public record ChatResult(string Response, List<string> Sources);
 
 public interface IChatService
 {
-    Task<ChatResult> ChatAsync(string userMessage, string userId, string orgId, string orgName);
+    Task<ChatResult> ChatAsync(string userMessage, string userId, string orgId, string orgName, string role, string? department);
 }

@@ -113,8 +113,12 @@ app.MapPost("/chat", async (ChatRequest request, ClaimsPrincipal user, IChatServ
     if (string.IsNullOrEmpty(orgId) || string.IsNullOrEmpty(email))
         return Results.Unauthorized();
 
-        var result = await chatService.ChatAsync(request.UserMessage, email, orgId, request.OrgName);
+    var role = user.FindFirst("role")?.Value ?? "member";
+    var department = user.FindFirst("department")?.Value;
+    if (string.IsNullOrWhiteSpace(department)) department = null;
 
+    var result = await chatService.ChatAsync(request.UserMessage, email, orgId, request.OrgName, role, department);
+    
     return Results.Ok(new
     {
         response = result.Response,
@@ -127,7 +131,7 @@ app.MapPost("/chat", async (ChatRequest request, ClaimsPrincipal user, IChatServ
 app.MapPost("/auth/register", async (RegisterRequest request, IAuthService authService, IAuditService audit, HttpContext http) =>
 {
     var ip = http.Connection.RemoteIpAddress?.ToString();
-        var emailInput = request.Email ?? "";
+    var emailInput = request.Email ?? "";
     var email = emailInput.Trim().ToLowerInvariant();
     var result = await authService.RegisterWithInviteAsync(emailInput, request.Password ?? "", request.InviteCode ?? "");
 
@@ -165,10 +169,15 @@ app.MapPost("/orgs/invites", async (CreateInviteRequest request, ClaimsPrincipal
     if (orgId is null || email is null) return Results.Unauthorized();
 
     var role = request.Role == "admin" ? "admin" : "member";
-    var (code, expiresAt) = await authService.CreateInviteAsync(orgId, role, email);
+    // Departments are stored trimmed and lowercase so "HR" and "hr " are the same department.
+    var department = request.Department?.Trim().ToLowerInvariant();
+    if (string.IsNullOrEmpty(department)) department = null;
+    if (department is not null && department.Length > 100)
+        return Results.BadRequest(new { error = "Department name is too long." });
+    var (code, expiresAt) = await authService.CreateInviteAsync(orgId, role, email, department);
 
     // Log that an invite was made, but never the code itself: it is a secret.
-    await audit.LogAsync("INVITE_CREATED", email, orgId, new { role, expiresAt });
+    await audit.LogAsync("INVITE_CREATED", email, orgId, new { role, department, expiresAt });
     return Results.Ok(new { code, expiresAt });
 }).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
 

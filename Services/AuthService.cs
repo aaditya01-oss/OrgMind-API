@@ -61,7 +61,8 @@ public class AuthService : IAuthService
                 Email = email,
                 PasswordHash = BCrypt.Net.BCrypt.HashPassword(password),
                 OrgId = invite.OrgId,
-                Role = invite.Role
+                Role = invite.Role,
+                Department = invite.Department
             };
             _context.Users.Add(user);
             await _context.SaveChangesAsync();
@@ -123,7 +124,7 @@ public class AuthService : IAuthService
         return GenerateJwtToken(user);
     }
 
-    public async Task<(string Code, DateTime ExpiresAt)> CreateInviteAsync(string orgId, string role, string createdBy)
+    public async Task<(string Code, DateTime ExpiresAt)> CreateInviteAsync(string orgId, string role, string createdBy, string? department = null)
     {
         var code = Convert.ToHexString(RandomNumberGenerator.GetBytes(8)); // 16 hex characters
         var invite = new Invite
@@ -131,6 +132,7 @@ public class AuthService : IAuthService
             Code = code,
             OrgId = orgId,
             Role = role,
+            Department = department,
             ExpiresAt = DateTime.UtcNow.AddDays(7),
             CreatedBy = createdBy
         };
@@ -151,7 +153,8 @@ public class AuthService : IAuthService
             new Claim("userId", user.Id.ToString()),
             new Claim("email", user.Email),
             new Claim("orgId", user.OrgId),
-            new Claim("role", user.Role)
+            new Claim("role", user.Role),
+            new Claim("department", user.Department ?? "")
         };
 
         var token = new JwtSecurityToken(

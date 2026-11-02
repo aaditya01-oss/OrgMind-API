@@ -7,5 +7,6 @@ public class User
     public string PasswordHash { get; set; } = string.Empty;
     public string OrgId { get; set; } = string.Empty;
     public string Role { get; set; } = "member";
+    public string? Department { get; set; }
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 }

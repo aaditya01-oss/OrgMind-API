@@ -40,6 +40,7 @@ public class OrgMindDbContext : DbContext
             entity.Property(e => e.PasswordHash).HasColumnName("password_hash");
             entity.Property(e => e.OrgId).HasColumnName("org_id");
             entity.Property(e => e.Role).HasColumnName("role");
+            entity.Property(e => e.Department).HasColumnName("department");
             entity.Property(e => e.CreatedAt).HasColumnName("created_at");
         });
 
@@ -59,6 +60,7 @@ modelBuilder.Entity<Invite>(entity =>
     entity.Property(e => e.Code).HasColumnName("code");
     entity.Property(e => e.OrgId).HasColumnName("org_id");
     entity.Property(e => e.Role).HasColumnName("role");
+    entity.Property(e => e.Department).HasColumnName("department");
     entity.Property(e => e.ExpiresAt).HasColumnName("expires_at");
     entity.Property(e => e.UsedAt).HasColumnName("used_at");
     entity.Property(e => e.CreatedBy).HasColumnName("created_by");

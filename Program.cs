@@ -118,7 +118,7 @@ app.MapPost("/chat", async (ChatRequest request, ClaimsPrincipal user, IChatServ
     if (string.IsNullOrWhiteSpace(department)) department = null;
 
     var result = await chatService.ChatAsync(request.UserMessage, email, orgId, request.OrgName, role, department);
-    
+
     return Results.Ok(new
     {
         response = result.Response,
@@ -220,7 +220,22 @@ async Task<IResult> HandleUpload(HttpRequest http, ClaimsPrincipal user, IDocume
         return Results.BadRequest(new { error = $"Allowed types: {string.Join(", ", allowed)}" });
 
     var docName = Path.GetFileName(file.FileName);
-    var (status, body) = await docs.ForwardAsync(route, file, orgId, email, docName);
+
+    // Who may see this document. Only the train route is limited to admins (see below),
+    // so only an admin's choice ever reaches the AI engine.
+    var visibility = form["visibility"].ToString().Trim().ToLowerInvariant();
+    if (visibility.Length == 0) visibility = "internal";
+    var allowedLabels = new[] { "public", "registered", "internal", "department", "admin_only" };
+    if (!allowedLabels.Contains(visibility))
+        return Results.BadRequest(new { error = "Invalid visibility choice." });
+    var department = form["department"].ToString().Trim().ToLowerInvariant();
+    if (visibility == "department" && department.Length == 0)
+        return Results.BadRequest(new { error = "Choose a department for a department-only document." });
+    if (department.Length > 100)
+        return Results.BadRequest(new { error = "Department name is too long." });
+    if (visibility != "department") department = "";
+
+    var (status, body) = await docs.ForwardAsync(route, file, orgId, email, docName, visibility, department);
 
         // 422 = the file itself is the problem (e.g. a scan with no text). That message was
     // written to be shown to users, so we pass it on.
@@ -245,7 +260,7 @@ async Task<IResult> HandleUpload(HttpRequest http, ClaimsPrincipal user, IDocume
 
 app.MapPost("/documents/train", (HttpRequest http, ClaimsPrincipal user, IDocumentService docs) =>
     HandleUpload(http, user, docs, "/documents/train", new[] { ".pdf", ".docx", ".txt" }))
-    .RequireAuthorization().RequireRateLimiting("user");
+    .RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
 
 app.MapPost("/documents/ocr", (HttpRequest http, ClaimsPrincipal user, IDocumentService docs) =>
     HandleUpload(http, user, docs, "/documents/ocr", new[] { ".pdf", ".png", ".jpg", ".jpeg" }))

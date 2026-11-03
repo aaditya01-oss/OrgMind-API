@@ -86,7 +86,19 @@ builder.Services.AddRateLimiter(options =>
                 Window = TimeSpan.FromMinutes(1),
                 QueueLimit = 0
             }));
+
+    // Anonymous website visitors: tight limit per IP, because every question costs AI quota
+    options.AddPolicy("public", httpContext =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 6,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0
+            }));
 });
+
 var app = builder.Build();
 
 app.UseHttpsRedirection();
@@ -128,6 +140,21 @@ app.MapPost("/chat", async (ChatRequest request, ClaimsPrincipal user, IChatServ
     });
 }).RequireAuthorization().RequireRateLimiting("user");
 
+
+app.MapPost("/public/chat", async (PublicChatRequest request, IChatService chatService) =>
+{
+    var message = (request.Message ?? "").Trim();
+    var orgId = (request.OrgId ?? "").Trim();
+    if (message.Length == 0 || orgId.Length == 0)
+        return Results.BadRequest(new { error = "A question and an organization are required." });
+    if (message.Length > 500)
+        return Results.BadRequest(new { error = "Please keep your question under 500 characters." });
+
+    // The role is fixed here on the server. A visitor can never claim a higher one.
+    var result = await chatService.ChatAsync(message, "visitor", orgId, "", "visitor", null);
+    return Results.Ok(new { response = result.Response, sources = result.Sources });
+}).AllowAnonymous().RequireRateLimiting("public");
+
 app.MapPost("/auth/register", async (RegisterRequest request, IAuthService authService, IAuditService audit, HttpContext http) =>
 {
     var ip = http.Connection.RemoteIpAddress?.ToString();
@@ -142,6 +169,23 @@ app.MapPost("/auth/register", async (RegisterRequest request, IAuthService authS
     }
 
     await audit.LogAsync("USER_JOINED", email, result.OrgId, new { role = result.Role, ip });
+    return Results.Ok(new AuthResponse { Token = result.Token!, Email = email, OrgId = result.OrgId!, Role = result.Role! });
+}).RequireRateLimiting("auth");
+
+app.MapPost("/auth/register-customer", async (RegisterCustomerRequest request, IAuthService authService, IAuditService audit, HttpContext http) =>
+{
+    var ip = http.Connection.RemoteIpAddress?.ToString();
+    var emailInput = request.Email ?? "";
+    var email = emailInput.Trim().ToLowerInvariant();
+    var result = await authService.RegisterCustomerAsync(emailInput, request.Password ?? "", request.OrgId ?? "");
+
+    if (!result.Success)
+    {
+        await audit.LogAsync("REGISTER_FAILED", email, null, new { reason = result.Error, method = "customer", ip }, "WARNING");
+        return Results.BadRequest(new { error = result.Error });
+    }
+
+    await audit.LogAsync("CUSTOMER_JOINED", email, result.OrgId, new { role = result.Role, ip });
     return Results.Ok(new AuthResponse { Token = result.Token!, Email = email, OrgId = result.OrgId!, Role = result.Role! });
 }).RequireRateLimiting("auth");
 
@@ -267,3 +311,6 @@ app.MapPost("/documents/ocr", (HttpRequest http, ClaimsPrincipal user, IDocument
     .RequireAuthorization().RequireRateLimiting("user");
 
 app.Run();
+
+public record RegisterCustomerRequest(string? Email, string? Password, string? OrgId);
+public record PublicChatRequest(string? Message, string? OrgId);

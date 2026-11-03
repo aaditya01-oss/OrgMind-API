@@ -32,6 +32,41 @@ public class AuthService : IAuthService
         return null;
     }
 
+    public async Task<AuthResult> RegisterCustomerAsync(string email, string password, string orgId)
+    {
+        var problem = Validate(email, password);
+        if (problem != null) return new AuthResult(false, Error: problem);
+
+        email = email.Trim().ToLowerInvariant();
+        orgId = (orgId ?? string.Empty).Trim();
+
+        // Same wording whether the org is missing or not, so nobody can probe which org ids exist.
+        if (orgId.Length == 0 || !await _context.Organizations.AnyAsync(o => o.Id == orgId))
+            return new AuthResult(false, Error: "We couldn't find that organization.");
+
+        if (await _context.Users.AnyAsync(u => u.Email.ToLower() == email))
+            return new AuthResult(false, Error: "That email is already registered.");
+
+        try
+        {
+            var user = new User
+            {
+                Email = email,
+                PasswordHash = BCrypt.Net.BCrypt.HashPassword(password),
+                OrgId = orgId,
+                Role = "customer",
+                Department = null
+            };
+            _context.Users.Add(user);
+            await _context.SaveChangesAsync();
+            return new AuthResult(true, GenerateJwtToken(user), orgId, "customer");
+        }
+        catch (DbUpdateException)
+        {
+            return new AuthResult(false, Error: "That email is already registered.");
+        }
+    }
+
     public async Task<AuthResult> RegisterWithInviteAsync(string email, string password, string inviteCode)
     {
         var problem = Validate(email, password);

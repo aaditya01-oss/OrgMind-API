@@ -16,6 +16,8 @@ public class OrgMindDbContext : DbContext
     public DbSet<Invite> Invites { get; set; }
     public DbSet<AuditLog> AuditLogs { get; set; }
 
+    public DbSet<Ticket> Tickets { get; set; }
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         modelBuilder.HasPostgresExtension("vector");
@@ -79,5 +81,18 @@ modelBuilder.Entity<AuditLog>(entity =>
     entity.Property(e => e.Timestamp).HasColumnName("timestamp")
           .HasDefaultValueSql("CURRENT_TIMESTAMP").ValueGeneratedOnAdd();
 });
+modelBuilder.Entity<Ticket>(entity =>
+        {
+            entity.ToTable("tickets");
+            entity.HasKey(e => e.Id);
+            entity.Property(e => e.Id).HasColumnName("id");
+            entity.Property(e => e.OrgId).HasColumnName("org_id");
+            entity.Property(e => e.CreatedBy).HasColumnName("created_by");
+            entity.Property(e => e.Issue).HasColumnName("issue");
+            entity.Property(e => e.Priority).HasColumnName("priority");
+            entity.Property(e => e.Status).HasColumnName("status");
+            entity.Property(e => e.CreatedAt).HasColumnName("created_at");
+            entity.Property(e => e.UpdatedAt).HasColumnName("updated_at");
+        });
     }
 }

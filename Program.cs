@@ -242,6 +242,57 @@ app.MapPost("/auth/login", async (LoginRequest request, IAuthService authService
     await audit.LogAsync("LOGIN_SUCCESS", email, orgId, new { ip });
     return Results.Ok(new { token });
 }).RequireRateLimiting("auth");
+
+// Staff (admin, employee) see every ticket in their organization. Customers see only their own.
+// The role and organization come from the signed token, never from the browser.
+app.MapGet("/tickets", async (ClaimsPrincipal user, OrgMindDbContext db) =>
+{
+    var orgId = user.FindFirst("orgId")?.Value;
+    var email = user.FindFirst("email")?.Value;
+    if (string.IsNullOrEmpty(orgId) || string.IsNullOrEmpty(email)) return Results.Unauthorized();
+
+    var role = user.FindFirst("role")?.Value;
+    var isStaff = role == "admin" || role == "member";
+
+    var query = db.Tickets.AsNoTracking().Where(t => t.OrgId == orgId);
+    if (!isStaff) query = query.Where(t => t.CreatedBy == email);
+
+    var rows = await query.OrderByDescending(t => t.CreatedAt).Take(200).ToListAsync();
+    return Results.Ok(rows.Select(t => new
+    {
+        id = t.Id,
+        number = "TKT-" + t.Id.ToString("D4"),
+        createdBy = t.CreatedBy,
+        issue = t.Issue,
+        priority = t.Priority,
+        status = t.Status,
+        createdAt = t.CreatedAt
+    }));
+}).RequireAuthorization().RequireRateLimiting("user");
+
+// Only staff can change a ticket's status. Every change is written to the audit log.
+app.MapPatch("/tickets/{id:int}/status", async (int id, TicketStatusRequest request, ClaimsPrincipal user, OrgMindDbContext db, IAuditService audit) =>
+{
+    var orgId = user.FindFirst("orgId")?.Value;
+    var email = user.FindFirst("email")?.Value;
+    if (string.IsNullOrEmpty(orgId) || string.IsNullOrEmpty(email)) return Results.Unauthorized();
+
+    var status = (request.Status ?? "").Trim().ToLowerInvariant();
+    if (status is not ("open" or "in_progress" or "resolved"))
+        return Results.BadRequest(new { error = "Status must be open, in_progress or resolved." });
+
+    var ticket = await db.Tickets.FirstOrDefaultAsync(t => t.Id == id && t.OrgId == orgId);
+    if (ticket is null) return Results.NotFound(new { error = "Ticket not found." });
+
+    var oldStatus = ticket.Status;
+    ticket.Status = status;
+    ticket.UpdatedAt = DateTime.UtcNow;
+    await db.SaveChangesAsync();
+
+    await audit.LogAsync("TICKET_STATUS_CHANGED", email, orgId, new { ticketId = id, from = oldStatus, to = status });
+    return Results.Ok(new { id, status });
+}).RequireAuthorization(p => p.RequireRole("admin", "member")).RequireRateLimiting("user");
+
 const long MaxUploadBytes = 20 * 1024 * 1024;
 
 async Task<IResult> HandleUpload(HttpRequest http, ClaimsPrincipal user, IDocumentService docs, string route, string[] allowed)
@@ -314,3 +365,5 @@ app.Run();
 
 public record RegisterCustomerRequest(string? Email, string? Password, string? OrgId);
 public record PublicChatRequest(string? Message, string? OrgId);
+
+public record TicketStatusRequest(string? Status);

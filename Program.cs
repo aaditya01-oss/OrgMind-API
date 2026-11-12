@@ -314,6 +314,67 @@ app.MapPatch("/tickets/{id:int}/status", async (int id, TicketStatusRequest requ
     return Results.Ok(new { id, status });
 }).RequireAuthorization().RequireRateLimiting("user");
 
+
+// Admin screens: people in this organization. Only admins, and only their own organization.
+// The password hash is never sent out.
+app.MapGet("/admin/users", async (ClaimsPrincipal user, OrgMindDbContext db) =>
+{
+    var orgId = user.FindFirst("orgId")?.Value;
+    if (string.IsNullOrEmpty(orgId)) return Results.Unauthorized();
+
+    var users = await db.Users.AsNoTracking()
+        .Where(u => u.OrgId == orgId)
+        .OrderBy(u => u.Id)
+        .Select(u => new { id = u.Id, email = u.Email, role = u.Role, department = u.Department, createdAt = u.CreatedAt })
+        .ToListAsync();
+    return Results.Ok(users);
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
+app.MapPatch("/admin/users/{id:int}", async (int id, UpdateUserRequest request, ClaimsPrincipal user, OrgMindDbContext db, IAuditService audit) =>
+{
+    var orgId = user.FindFirst("orgId")?.Value;
+    var adminEmail = user.FindFirst("email")?.Value;
+    if (string.IsNullOrEmpty(orgId) || string.IsNullOrEmpty(adminEmail)) return Results.Unauthorized();
+
+    var target = await db.Users.FirstOrDefaultAsync(u => u.Id == id && u.OrgId == orgId);
+    if (target is null) return Results.NotFound(new { error = "User not found." });
+
+    var oldRole = target.Role;
+    var oldDepartment = target.Department;
+
+    if (request.Role is not null)
+    {
+        var role = request.Role.Trim().ToLowerInvariant();
+        if (role is not ("admin" or "member" or "customer"))
+            return Results.BadRequest(new { error = "Role must be admin, member or customer." });
+
+        // An organization must always keep at least one admin.
+        if (target.Role == "admin" && role != "admin")
+        {
+            var otherAdmins = await db.Users.CountAsync(u => u.OrgId == orgId && u.Role == "admin" && u.Id != id);
+            if (otherAdmins == 0)
+                return Results.BadRequest(new { error = "The organization must keep at least one admin." });
+        }
+        target.Role = role;
+    }
+
+    if (request.Department is not null)
+    {
+        var dept = request.Department.Trim().ToLowerInvariant();
+        if (dept.Length > 100) return Results.BadRequest(new { error = "Department name is too long." });
+        target.Department = dept.Length == 0 ? null : dept;
+    }
+
+    // Customers are outsiders and never belong to a department.
+    if (target.Role == "customer") target.Department = null;
+
+    await db.SaveChangesAsync();
+    await audit.LogAsync("USER_UPDATED", adminEmail, orgId,
+        new { userId = id, roleFrom = oldRole, roleTo = target.Role, departmentFrom = oldDepartment, departmentTo = target.Department });
+
+    return Results.Ok(new { id, role = target.Role, department = target.Department });
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
 const long MaxUploadBytes = 20 * 1024 * 1024;
 
 async Task<IResult> HandleUpload(HttpRequest http, ClaimsPrincipal user, IDocumentService docs, string route, string[] allowed)
@@ -388,3 +449,5 @@ public record RegisterCustomerRequest(string? Email, string? Password, string? O
 public record PublicChatRequest(string? Message, string? OrgId);
 
 public record TicketStatusRequest(string? Status);
+
+public record UpdateUserRequest(string? Role, string? Department);

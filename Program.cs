@@ -375,6 +375,74 @@ app.MapPatch("/admin/users/{id:int}", async (int id, UpdateUserRequest request, 
     return Results.Ok(new { id, role = target.Role, department = target.Department });
 }).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
 
+
+
+// Turns the AI engine's answer into a safe response for the browser.
+IResult EngineResult(int status, string body, string fallback)
+{
+    if (status >= 200 && status < 300) return Results.Content(body, "application/json");
+
+    var message = fallback;
+    try
+    {
+        using var json = System.Text.Json.JsonDocument.Parse(body);
+        if (json.RootElement.TryGetProperty("detail", out var d) && d.ValueKind == System.Text.Json.JsonValueKind.String)
+            message = d.GetString() ?? message;
+    }
+    catch (System.Text.Json.JsonException) { }
+
+    return status is 404 or 422
+        ? Results.Json(new { error = message }, statusCode: status)
+        : Results.Problem(fallback, statusCode: 502);
+}
+
+// Admin: the knowledge base of THIS organization (the organization comes from the token).
+app.MapGet("/admin/documents", async (ClaimsPrincipal user, IDocumentService docs) =>
+{
+    var orgId = user.FindFirst("orgId")?.Value;
+    if (string.IsNullOrEmpty(orgId)) return Results.Unauthorized();
+
+    var (status, body) = await docs.ListAsync(orgId);
+    return EngineResult(status, body, "The document service could not list the documents.");
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
+app.MapPost("/admin/documents/relabel", async (DocLabelRequest request, ClaimsPrincipal user, IDocumentService docs) =>
+{
+    var orgId = user.FindFirst("orgId")?.Value;
+    var email = user.FindFirst("email")?.Value;
+    if (string.IsNullOrEmpty(orgId) || string.IsNullOrEmpty(email)) return Results.Unauthorized();
+
+    var docName = (request.DocName ?? "").Trim();
+    var visibility = (request.Visibility ?? "").Trim().ToLowerInvariant();
+    var department = (request.Department ?? "").Trim().ToLowerInvariant();
+
+    if (docName.Length == 0 || docName.Length > 255)
+        return Results.BadRequest(new { error = "A valid document name is required." });
+    if (!new[] { "public", "registered", "internal", "department", "admin_only" }.Contains(visibility))
+        return Results.BadRequest(new { error = "Invalid visibility choice." });
+    if (visibility == "department" && department.Length == 0)
+        return Results.BadRequest(new { error = "Choose a department for a department-only document." });
+    if (department.Length > 100)
+        return Results.BadRequest(new { error = "Department name is too long." });
+
+    var (status, body) = await docs.RelabelAsync(orgId, docName, visibility, department.Length == 0 ? null : department, email);
+    return EngineResult(status, body, "The document service could not change the label.");
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
+app.MapPost("/admin/documents/delete", async (DocDeleteRequest request, ClaimsPrincipal user, IDocumentService docs) =>
+{
+    var orgId = user.FindFirst("orgId")?.Value;
+    var email = user.FindFirst("email")?.Value;
+    if (string.IsNullOrEmpty(orgId) || string.IsNullOrEmpty(email)) return Results.Unauthorized();
+
+    var docName = (request.DocName ?? "").Trim();
+    if (docName.Length == 0 || docName.Length > 255)
+        return Results.BadRequest(new { error = "A valid document name is required." });
+
+    var (status, body) = await docs.DeleteAsync(orgId, docName, email);
+    return EngineResult(status, body, "The document service could not delete the document.");
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
 const long MaxUploadBytes = 20 * 1024 * 1024;
 
 async Task<IResult> HandleUpload(HttpRequest http, ClaimsPrincipal user, IDocumentService docs, string route, string[] allowed)
@@ -451,3 +519,6 @@ public record PublicChatRequest(string? Message, string? OrgId);
 public record TicketStatusRequest(string? Status);
 
 public record UpdateUserRequest(string? Role, string? Department);
+
+public record DocLabelRequest(string? DocName, string? Visibility, string? Department);
+public record DocDeleteRequest(string? DocName);

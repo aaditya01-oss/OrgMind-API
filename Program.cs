@@ -243,8 +243,10 @@ app.MapPost("/auth/login", async (LoginRequest request, IAuthService authService
     return Results.Ok(new { token });
 }).RequireRateLimiting("auth");
 
-// Staff (admin, employee) see every ticket in their organization. Customers see only their own.
-// The role and organization come from the signed token, never from the browser.
+// Who sees what (role and department come from the signed token, never from the browser):
+//   admin                      -> every ticket in the organization
+//   employee with a department -> own tickets + tickets routed to their department
+//   everyone else              -> own tickets only
 app.MapGet("/tickets", async (ClaimsPrincipal user, OrgMindDbContext db) =>
 {
     var orgId = user.FindFirst("orgId")?.Value;
@@ -252,10 +254,18 @@ app.MapGet("/tickets", async (ClaimsPrincipal user, OrgMindDbContext db) =>
     if (string.IsNullOrEmpty(orgId) || string.IsNullOrEmpty(email)) return Results.Unauthorized();
 
     var role = user.FindFirst("role")?.Value;
-    var isStaff = role == "admin" || role == "member";
+    var department = user.FindFirst("department")?.Value;
+    if (string.IsNullOrWhiteSpace(department)) department = null;
+
+    var isAdmin = role == "admin";
+    var isDeptStaff = role == "member" && department != null;
 
     var query = db.Tickets.AsNoTracking().Where(t => t.OrgId == orgId);
-    if (!isStaff) query = query.Where(t => t.CreatedBy == email);
+    if (!isAdmin)
+    {
+        if (isDeptStaff) query = query.Where(t => t.CreatedBy == email || t.Department == department);
+        else query = query.Where(t => t.CreatedBy == email);
+    }
 
     var rows = await query.OrderByDescending(t => t.CreatedAt).Take(200).ToListAsync();
     return Results.Ok(rows.Select(t => new
@@ -266,16 +276,22 @@ app.MapGet("/tickets", async (ClaimsPrincipal user, OrgMindDbContext db) =>
         issue = t.Issue,
         priority = t.Priority,
         status = t.Status,
+        department = t.Department,
+        // Admins can change any ticket. A department's employees can change that department's tickets.
+        canManage = isAdmin || (isDeptStaff && t.Department == department),
         createdAt = t.CreatedAt
     }));
 }).RequireAuthorization().RequireRateLimiting("user");
 
-// Only staff can change a ticket's status. Every change is written to the audit log.
 app.MapPatch("/tickets/{id:int}/status", async (int id, TicketStatusRequest request, ClaimsPrincipal user, OrgMindDbContext db, IAuditService audit) =>
 {
     var orgId = user.FindFirst("orgId")?.Value;
     var email = user.FindFirst("email")?.Value;
     if (string.IsNullOrEmpty(orgId) || string.IsNullOrEmpty(email)) return Results.Unauthorized();
+
+    var role = user.FindFirst("role")?.Value;
+    var department = user.FindFirst("department")?.Value;
+    if (string.IsNullOrWhiteSpace(department)) department = null;
 
     var status = (request.Status ?? "").Trim().ToLowerInvariant();
     if (status is not ("open" or "in_progress" or "resolved"))
@@ -284,14 +300,19 @@ app.MapPatch("/tickets/{id:int}/status", async (int id, TicketStatusRequest requ
     var ticket = await db.Tickets.FirstOrDefaultAsync(t => t.Id == id && t.OrgId == orgId);
     if (ticket is null) return Results.NotFound(new { error = "Ticket not found." });
 
+    var allowed = role == "admin"
+        || (role == "member" && department != null && ticket.Department == department);
+    if (!allowed) return Results.StatusCode(403);
+
     var oldStatus = ticket.Status;
     ticket.Status = status;
     ticket.UpdatedAt = DateTime.UtcNow;
     await db.SaveChangesAsync();
 
-    await audit.LogAsync("TICKET_STATUS_CHANGED", email, orgId, new { ticketId = id, from = oldStatus, to = status });
+    await audit.LogAsync("TICKET_STATUS_CHANGED", email, orgId,
+        new { ticketId = id, from = oldStatus, to = status, department = ticket.Department });
     return Results.Ok(new { id, status });
-}).RequireAuthorization(p => p.RequireRole("admin", "member")).RequireRateLimiting("user");
+}).RequireAuthorization().RequireRateLimiting("user");
 
 const long MaxUploadBytes = 20 * 1024 * 1024;
 

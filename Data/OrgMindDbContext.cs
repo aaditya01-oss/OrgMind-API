@@ -93,6 +93,7 @@ modelBuilder.Entity<Ticket>(entity =>
             entity.Property(e => e.Status).HasColumnName("status");
             entity.Property(e => e.CreatedAt).HasColumnName("created_at");
             entity.Property(e => e.UpdatedAt).HasColumnName("updated_at");
+            entity.Property(e => e.Department).HasColumnName("department");
         });
     }
 }

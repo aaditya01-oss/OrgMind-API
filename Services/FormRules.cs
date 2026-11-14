@@ -30,7 +30,7 @@ public static class FormRules
     public static readonly string[] Audiences = { "customer", "employee", "public" };
     public static readonly string[] Statuses = { "new", "in_progress", "approved", "rejected", "done" };
 
-    private static readonly string[] Types = { "text", "number", "date", "phone", "email", "select", "textarea" };
+        private static readonly string[] Types = { "text", "number", "date", "phone", "email", "select", "textarea", "time", "datetime", "daterange" };
     private static readonly Regex KeyPattern = new("^[a-z][a-z0-9_]{0,39}$");
     private static readonly Regex AutofillPattern = new("^[a-z][a-z_]{0,29}$");
     private static readonly Regex EmailPattern = new(@"^[^@\s]+@[^@\s]+\.[^@\s]+$");
@@ -50,6 +50,16 @@ public static class FormRules
 
     private static bool Flag(JsonElement e, string name) =>
         e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.True;
+
+    private static bool WithinLimit(DateOnly day, string limit, DateOnly today) => limit switch
+    {
+        "past" => day <= today,
+        "future" => day >= today,
+        _ => true
+    };
+
+    private static string LimitMessage(string label, string limit) =>
+        limit == "past" ? $"{label} cannot be in the future." : $"{label} cannot be in the past.";
 
     // Checks an admin's form definition and returns a clean version.
     public static bool TryValidateTemplate(FormTemplateRequest r, out string name, out string? description,
@@ -114,6 +124,12 @@ public static class FormRules
 
             var autofill = Text(f, "autofill");
             if (autofill != "" && !AutofillPattern.IsMatch(autofill)) { error = $"Question \"{label}\" has an invalid autofill name."; return false; }
+            
+            var dateLimit = Text(f, "dateLimit").ToLowerInvariant();
+            var isDateType = type is "date" or "datetime" or "daterange";
+            if (dateLimit != "" && (!isDateType || (dateLimit != "past" && dateLimit != "future")))
+            { error = $"Question \"{label}\" has an invalid date limit."; return false; }
+
 
             var item = new Dictionary<string, object?>
             {
@@ -125,6 +141,7 @@ public static class FormRules
             };
             if (type == "select") item["options"] = options;
             if (autofill != "") item["autofill"] = autofill;
+              if (dateLimit != "") item["dateLimit"] = dateLimit;
             list.Add(item);
         }
 
@@ -138,14 +155,14 @@ public static class FormRules
         json = "{}";
         error = "";
         var clean = new Dictionary<string, string>();
-
+                var today = DateOnly.FromDateTime(DateTime.UtcNow.AddMinutes(345));
         using var doc = JsonDocument.Parse(fieldsJson);
         foreach (var f in doc.RootElement.EnumerateArray())
         {
             var key = Text(f, "key");
             var label = Text(f, "label");
             var type = Text(f, "type");
-
+                        var dateLimit = Text(f, "dateLimit");
             var value = "";
             if (data.TryGetValue(key, out var raw))
                 value = (raw.ValueKind == JsonValueKind.String ? raw.GetString() : raw.ToString())?.Trim() ?? "";
@@ -171,9 +188,29 @@ public static class FormRules
                 case "phone":
                     if (!PhonePattern.IsMatch(value)) { error = $"{label} must be a valid phone number."; return false; }
                     break;
-                case "date":
-                    if (!DateOnly.TryParseExact(value, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out _))
+                                case "date":
+                    if (!DateOnly.TryParseExact(value, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var day))
                     { error = $"{label} must be a date written as YYYY-MM-DD."; return false; }
+                    if (!WithinLimit(day, dateLimit, today)) { error = LimitMessage(label, dateLimit); return false; }
+                    break;
+                case "time":
+                    if (!TimeOnly.TryParseExact(value, "HH:mm", CultureInfo.InvariantCulture, DateTimeStyles.None, out _))
+                    { error = $"{label} must be a time written as HH:MM."; return false; }
+                    break;
+                case "datetime":
+                    if (!DateTime.TryParseExact(value, "yyyy-MM-dd'T'HH:mm", CultureInfo.InvariantCulture, DateTimeStyles.None, out var moment))
+                    { error = $"{label} must be a date and a time."; return false; }
+                    if (!WithinLimit(DateOnly.FromDateTime(moment), dateLimit, today)) { error = LimitMessage(label, dateLimit); return false; }
+                    break;
+                case "daterange":
+                    var parts = value.Split('/');
+                    if (parts.Length != 2
+                        || !DateOnly.TryParseExact(parts[0], "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var rangeStart)
+                        || !DateOnly.TryParseExact(parts[1], "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var rangeEnd))
+                    { error = $"{label} needs a start date and an end date."; return false; }
+                    if (rangeEnd < rangeStart) { error = $"{label}: the end date cannot be before the start date."; return false; }
+                    if (!WithinLimit(rangeStart, dateLimit, today) || !WithinLimit(rangeEnd, dateLimit, today))
+                    { error = LimitMessage(label, dateLimit); return false; }
                     break;
                 case "select":
                     var ok = f.TryGetProperty("options", out var opts)

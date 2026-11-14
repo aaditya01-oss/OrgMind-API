@@ -9,6 +9,7 @@ using OrgMind.API.Services;
 using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.RateLimiting;
 using System.IdentityModel.Tokens.Jwt;
+using System.Text.Json;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -75,7 +76,11 @@ builder.Services.AddRateLimiter(options =>
             }));
 
     // Chat and uploads: limited per signed-in user
-    options.AddPolicy("user", httpContext =>
+   
+
+    // Anonymous website visitors: tight limit per IP, because every question costs AI quota
+        // Chat and uploads: strict, because every call costs AI quota
+    options.AddPolicy("chat", httpContext =>
         RateLimitPartition.GetFixedWindowLimiter(
             httpContext.User.FindFirst("email")?.Value
                 ?? httpContext.Connection.RemoteIpAddress?.ToString()
@@ -87,6 +92,20 @@ builder.Services.AddRateLimiter(options =>
                 QueueLimit = 0
             }));
 
+    // Everything else a signed-in user does (lists, tickets, admin screens): generous
+    options.AddPolicy("user", httpContext =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            httpContext.User.FindFirst("email")?.Value
+                ?? httpContext.Connection.RemoteIpAddress?.ToString()
+                ?? "unknown",
+            _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 120,
+                Window = TimeSpan.FromMinutes(1),
+                QueueLimit = 0
+            }));
+
+    
     // Anonymous website visitors: tight limit per IP, because every question costs AI quota
     options.AddPolicy("public", httpContext =>
         RateLimitPartition.GetFixedWindowLimiter(
@@ -96,7 +115,7 @@ builder.Services.AddRateLimiter(options =>
                 PermitLimit = 6,
                 Window = TimeSpan.FromMinutes(1),
                 QueueLimit = 0
-            }));
+            }));        
 });
 
 var app = builder.Build();
@@ -138,7 +157,7 @@ app.MapPost("/chat", async (ChatRequest request, ClaimsPrincipal user, IChatServ
         orgId,
         sources = result.Sources
     });
-}).RequireAuthorization().RequireRateLimiting("user");
+}).RequireAuthorization().RequireRateLimiting("chat");
 
 
 app.MapPost("/public/chat", async (PublicChatRequest request, IChatService chatService) =>
@@ -396,6 +415,286 @@ IResult EngineResult(int status, string body, string fallback)
         : Results.Problem(fallback, statusCode: 502);
 }
 
+
+
+// One call that feeds the admin Overview page. Counts only: no ticket text, no audit details.
+app.MapGet("/admin/overview", async (ClaimsPrincipal user, OrgMindDbContext db) =>
+{
+    var orgId = user.FindFirst("orgId")?.Value;
+    if (string.IsNullOrEmpty(orgId)) return Results.Forbid();
+
+    var weekAgo = DateTime.UtcNow.AddDays(-7);
+
+    var usersByRole = await db.Users
+        .Where(u => u.OrgId == orgId)
+        .GroupBy(u => u.Role)
+        .Select(g => new { role = g.Key, count = g.Count() })
+        .ToListAsync();
+
+    var newUsers = await db.Users.CountAsync(u => u.OrgId == orgId && u.CreatedAt >= weekAgo);
+
+    var departments = await db.Users
+        .Where(u => u.OrgId == orgId && u.Department != null && u.Department != "")
+        .GroupBy(u => u.Department)
+        .Select(g => new { department = g.Key, people = g.Count() })
+        .ToListAsync();
+
+    var ticketsByStatus = await db.Tickets
+        .Where(t => t.OrgId == orgId)
+        .GroupBy(t => t.Status)
+        .Select(g => new { status = g.Key, count = g.Count() })
+        .ToListAsync();
+
+    var openByDepartment = await db.Tickets
+        .Where(t => t.OrgId == orgId && t.Status != "resolved" && t.Status != "closed")
+        .GroupBy(t => t.Department)
+        .Select(g => new { department = g.Key ?? "unassigned", count = g.Count() })
+        .ToListAsync();
+
+    var recent = await db.AuditLogs
+        .Where(a => a.OrgId == orgId)
+        .OrderByDescending(a => a.Timestamp)
+        .Take(8)
+        .Select(a => new { eventType = a.EventType, userId = a.UserId, severity = a.Severity, timestamp = a.Timestamp })
+        .ToListAsync();
+
+    return Results.Ok(new { usersByRole, newUsers, departments, ticketsByStatus, openByDepartment, recent });
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
+
+// ===========================================================================
+// Forms: templates made by admins, submissions routed to a department.
+// Lists never include what people typed; only opening one submission does.
+// ===========================================================================
+
+// Forms the signed-in person may fill.
+app.MapGet("/forms", async (ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var audiences = FormRules.AudiencesFor(me.Role);
+    var rows = await db.FormTemplates.AsNoTracking()
+        .Where(f => f.OrgId == me.OrgId && f.Active && audiences.Contains(f.Audience))
+        .OrderBy(f => f.Name)
+        .ToListAsync();
+
+    return Results.Ok(rows.Select(f => new
+    {
+        id = f.Id,
+        name = f.Name,
+        description = f.Description,
+        audience = f.Audience,
+        fields = JsonSerializer.Deserialize<JsonElement>(f.Fields)
+    }));
+}).RequireAuthorization().RequireRateLimiting("user");
+
+// Submit a form. The server re-checks every answer and routes it to the form's department.
+app.MapPost("/forms/{id:int}/submit", async (int id, FormSubmitRequest request, ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var form = await db.FormTemplates.FirstOrDefaultAsync(f => f.Id == id && f.OrgId == me.OrgId && f.Active);
+    if (form is null || !FormRules.AudiencesFor(me.Role).Contains(form.Audience))
+        return Results.NotFound(new { error = "Form not found." });
+
+    if (!FormRules.TryCleanAnswers(form.Fields, request.Data ?? new Dictionary<string, JsonElement>(), out var cleaned, out var error))
+        return Results.BadRequest(new { error });
+
+    var submission = new FormSubmission
+    {
+        OrgId = me.OrgId!,
+        TemplateId = form.Id,
+        TemplateName = form.Name,
+        SubmittedBy = me.Email,
+        Department = form.Department,
+        Data = cleaned
+    };
+    db.FormSubmissions.Add(submission);
+    await db.SaveChangesAsync();
+
+    // The audit log gets ids only, never what the person typed.
+    await audit.LogAsync("FORM_SUBMITTED", me.Email, me.OrgId,
+        new { submissionId = submission.Id, formId = form.Id, department = form.Department });
+
+    return Results.Ok(new { id = submission.Id, number = "FRM-" + submission.Id.ToString("D4"), status = submission.Status });
+}).RequireAuthorization().RequireRateLimiting("chat");   // strict: keeps spam out
+
+// Submissions the person is allowed to see (no answers in the list).
+app.MapGet("/submissions", async (ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var query = db.FormSubmissions.AsNoTracking().Where(s => s.OrgId == me.OrgId);
+    if (!me.IsAdmin)
+    {
+        if (me.IsDeptStaff) query = query.Where(s => s.SubmittedBy == me.Email || s.Department == me.Department);
+        else query = query.Where(s => s.SubmittedBy == me.Email);
+    }
+
+    var rows = await query.OrderByDescending(s => s.CreatedAt).Take(200).ToListAsync();
+    return Results.Ok(rows.Select(s => new
+    {
+        id = s.Id,
+        number = "FRM-" + s.Id.ToString("D4"),
+        templateName = s.TemplateName,
+        submittedBy = s.SubmittedBy,
+        department = s.Department,
+        status = s.Status,
+        canManage = me.IsAdmin || (me.IsDeptStaff && s.Department == me.Department),
+        createdAt = s.CreatedAt
+    }));
+}).RequireAuthorization().RequireRateLimiting("user");
+
+// One submission with its answers. Opening someone else's is recorded in the audit log.
+app.MapGet("/submissions/{id:int}", async (int id, ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var s = await db.FormSubmissions.AsNoTracking().FirstOrDefaultAsync(x => x.Id == id && x.OrgId == me.OrgId);
+    var allowed = s is not null &&
+        (me.IsAdmin || s.SubmittedBy == me.Email || (me.IsDeptStaff && s.Department == me.Department));
+    if (s is null || !allowed) return Results.NotFound(new { error = "Submission not found." });   // same answer for "missing" and "not yours"
+
+    if (s.SubmittedBy != me.Email)
+        await audit.LogAsync("FORM_SUBMISSION_VIEWED", me.Email, me.OrgId,
+            new { submissionId = s.Id, formId = s.TemplateId, department = s.Department });
+
+    var form = await db.FormTemplates.AsNoTracking().FirstOrDefaultAsync(f => f.Id == s.TemplateId && f.OrgId == me.OrgId);
+
+    return Results.Ok(new
+    {
+        id = s.Id,
+        number = "FRM-" + s.Id.ToString("D4"),
+        templateName = s.TemplateName,
+        submittedBy = s.SubmittedBy,
+        department = s.Department,
+        status = s.Status,
+        handledBy = s.HandledBy,
+        canManage = me.IsAdmin || (me.IsDeptStaff && s.Department == me.Department),
+        createdAt = s.CreatedAt,
+        fields = JsonSerializer.Deserialize<JsonElement>(form?.Fields ?? "[]"),
+        data = JsonSerializer.Deserialize<JsonElement>(s.Data)
+    });
+}).RequireAuthorization().RequireRateLimiting("user");
+
+// Change a submission's status: an admin, or an employee of the handling department.
+app.MapPatch("/submissions/{id:int}/status", async (int id, FormStatusRequest request, ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var status = (request.Status ?? "").Trim().ToLowerInvariant();
+    if (!FormRules.Statuses.Contains(status))
+        return Results.BadRequest(new { error = "Status must be new, in_progress, approved, rejected or done." });
+
+    var s = await db.FormSubmissions.FirstOrDefaultAsync(x => x.Id == id && x.OrgId == me.OrgId);
+    if (s is null) return Results.NotFound(new { error = "Submission not found." });
+
+    var allowed = me.IsAdmin || (me.IsDeptStaff && s.Department == me.Department);
+    if (!allowed) return Results.StatusCode(403);
+
+    var oldStatus = s.Status;
+    s.Status = status;
+    s.HandledBy = me.Email;
+    s.UpdatedAt = DateTime.UtcNow;
+    await db.SaveChangesAsync();
+
+    await audit.LogAsync("FORM_STATUS_CHANGED", me.Email, me.OrgId,
+        new { submissionId = id, from = oldStatus, to = status, department = s.Department });
+    return Results.Ok(new { id, status });
+}).RequireAuthorization().RequireRateLimiting("user");
+
+// ---- Admin: manage form templates --------------------------------------------------
+
+app.MapGet("/admin/forms", async (ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var forms = await db.FormTemplates.AsNoTracking()
+        .Where(f => f.OrgId == me.OrgId).OrderBy(f => f.Name).ToListAsync();
+    var counts = await db.FormSubmissions.AsNoTracking()
+        .Where(s => s.OrgId == me.OrgId)
+        .GroupBy(s => s.TemplateId)
+        .Select(g => new { templateId = g.Key, total = g.Count(), open = g.Count(s => s.Status == "new" || s.Status == "in_progress") })
+        .ToListAsync();
+
+    return Results.Ok(forms.Select(f =>
+    {
+        var c = counts.FirstOrDefault(x => x.templateId == f.Id);
+        return new
+        {
+            id = f.Id,
+            name = f.Name,
+            description = f.Description,
+            audience = f.Audience,
+            department = f.Department,
+            active = f.Active,
+            fields = JsonSerializer.Deserialize<JsonElement>(f.Fields),
+            submissions = c?.total ?? 0,
+            open = c?.open ?? 0
+        };
+    }));
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
+app.MapPost("/admin/forms", async (FormTemplateRequest request, ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    if (!FormRules.TryValidateTemplate(request, out var name, out var description, out var audience,
+                                       out var department, out var fieldsJson, out var error))
+        return Results.BadRequest(new { error });
+
+    var form = new FormTemplate
+    {
+        OrgId = me.OrgId!,
+        Name = name,
+        Description = description,
+        Audience = audience,
+        Department = department,
+        Fields = fieldsJson,
+        Active = request.Active ?? true,
+        CreatedBy = me.Email!
+    };
+    db.FormTemplates.Add(form);
+    await db.SaveChangesAsync();
+
+    await audit.LogAsync("FORM_TEMPLATE_CREATED", me.Email, me.OrgId,
+        new { formId = form.Id, audience, department });
+    return Results.Ok(new { id = form.Id });
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
+app.MapPut("/admin/forms/{id:int}", async (int id, FormTemplateRequest request, ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var form = await db.FormTemplates.FirstOrDefaultAsync(f => f.Id == id && f.OrgId == me.OrgId);
+    if (form is null) return Results.NotFound(new { error = "Form not found." });
+
+    if (!FormRules.TryValidateTemplate(request, out var name, out var description, out var audience,
+                                       out var department, out var fieldsJson, out var error))
+        return Results.BadRequest(new { error });
+
+    form.Name = name;
+    form.Description = description;
+    form.Audience = audience;
+    form.Department = department;
+    form.Fields = fieldsJson;
+    form.Active = request.Active ?? form.Active;
+    form.UpdatedAt = DateTime.UtcNow;
+    await db.SaveChangesAsync();
+
+    await audit.LogAsync("FORM_TEMPLATE_UPDATED", me.Email, me.OrgId,
+        new { formId = id, audience, department, active = form.Active });
+    return Results.Ok(new { id });
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
 // Admin: the knowledge base of THIS organization (the organization comes from the token).
 app.MapGet("/admin/documents", async (ClaimsPrincipal user, IDocumentService docs) =>
 {
@@ -505,11 +804,11 @@ async Task<IResult> HandleUpload(HttpRequest http, ClaimsPrincipal user, IDocume
 
 app.MapPost("/documents/train", (HttpRequest http, ClaimsPrincipal user, IDocumentService docs) =>
     HandleUpload(http, user, docs, "/documents/train", new[] { ".pdf", ".docx", ".txt" }))
-    .RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+    .RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("chat");
 
 app.MapPost("/documents/ocr", (HttpRequest http, ClaimsPrincipal user, IDocumentService docs) =>
     HandleUpload(http, user, docs, "/documents/ocr", new[] { ".pdf", ".png", ".jpg", ".jpeg" }))
-    .RequireAuthorization().RequireRateLimiting("user");
+    .RequireAuthorization().RequireRateLimiting("chat");
 
 app.Run();
 

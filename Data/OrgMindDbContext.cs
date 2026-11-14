@@ -18,6 +18,9 @@ public class OrgMindDbContext : DbContext
 
     public DbSet<Ticket> Tickets { get; set; }
 
+    public DbSet<FormTemplate> FormTemplates { get; set; }
+    public DbSet<FormSubmission> FormSubmissions { get; set; }
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         modelBuilder.HasPostgresExtension("vector");
@@ -94,6 +97,41 @@ modelBuilder.Entity<Ticket>(entity =>
             entity.Property(e => e.CreatedAt).HasColumnName("created_at");
             entity.Property(e => e.UpdatedAt).HasColumnName("updated_at");
             entity.Property(e => e.Department).HasColumnName("department");
+        });
+
+        
+        modelBuilder.Entity<FormTemplate>(entity =>
+        {
+            entity.ToTable("form_templates");
+            entity.HasKey(e => e.Id);
+            entity.Property(e => e.Id).HasColumnName("id");
+            entity.Property(e => e.OrgId).HasColumnName("org_id");
+            entity.Property(e => e.Name).HasColumnName("name");
+            entity.Property(e => e.Description).HasColumnName("description");
+            entity.Property(e => e.Audience).HasColumnName("audience");
+            entity.Property(e => e.Department).HasColumnName("department");
+            entity.Property(e => e.Fields).HasColumnName("fields").HasColumnType("jsonb");
+            entity.Property(e => e.Active).HasColumnName("active");
+            entity.Property(e => e.CreatedBy).HasColumnName("created_by");
+            entity.Property(e => e.CreatedAt).HasColumnName("created_at");
+            entity.Property(e => e.UpdatedAt).HasColumnName("updated_at");
+        });
+
+        modelBuilder.Entity<FormSubmission>(entity =>
+        {
+            entity.ToTable("form_submissions");
+            entity.HasKey(e => e.Id);
+            entity.Property(e => e.Id).HasColumnName("id");
+            entity.Property(e => e.OrgId).HasColumnName("org_id");
+            entity.Property(e => e.TemplateId).HasColumnName("template_id");
+            entity.Property(e => e.TemplateName).HasColumnName("template_name");
+            entity.Property(e => e.SubmittedBy).HasColumnName("submitted_by");
+            entity.Property(e => e.Department).HasColumnName("department");
+            entity.Property(e => e.Data).HasColumnName("data").HasColumnType("jsonb");
+            entity.Property(e => e.Status).HasColumnName("status");
+            entity.Property(e => e.HandledBy).HasColumnName("handled_by");
+            entity.Property(e => e.CreatedAt).HasColumnName("created_at");
+            entity.Property(e => e.UpdatedAt).HasColumnName("updated_at");
         });
     }
 }

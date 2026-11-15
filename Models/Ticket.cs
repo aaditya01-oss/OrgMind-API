@@ -9,6 +9,8 @@ public class Ticket
     public string Priority { get; set; } = "medium";
     public string Status { get; set; } = "open";
     public string? Department { get; set; }
+
+    public string? Sentiment { get; set; }
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 }

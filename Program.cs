@@ -295,6 +295,7 @@ app.MapGet("/tickets", async (ClaimsPrincipal user, OrgMindDbContext db) =>
         issue = t.Issue,
         priority = t.Priority,
         status = t.Status,
+        sentiment = t.Sentiment,
         department = t.Department,
         // Admins can change any ticket. A department's employees can change that department's tickets.
         canManage = isAdmin || (isDeptStaff && t.Department == department),
@@ -344,7 +345,7 @@ app.MapGet("/admin/users", async (ClaimsPrincipal user, OrgMindDbContext db) =>
     var users = await db.Users.AsNoTracking()
         .Where(u => u.OrgId == orgId)
         .OrderBy(u => u.Id)
-        .Select(u => new { id = u.Id, email = u.Email, role = u.Role, department = u.Department, createdAt = u.CreatedAt })
+        .Select(u => new { id = u.Id, email = u.Email, role = u.Role, department = u.Department, employeeId = u.EmployeeId, createdAt = u.CreatedAt })
         .ToListAsync();
     return Results.Ok(users);
 }).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
@@ -360,12 +361,17 @@ app.MapPatch("/admin/users/{id:int}", async (int id, UpdateUserRequest request, 
 
     var oldRole = target.Role;
     var oldDepartment = target.Department;
+    var oldEmployeeId = target.EmployeeId;
 
-    if (request.Role is not null)
+        if (request.Role is not null)
     {
         var role = request.Role.Trim().ToLowerInvariant();
-        if (role is not ("admin" or "member" or "customer"))
-            return Results.BadRequest(new { error = "Role must be admin, member or customer." });
+        if (role is not ("admin" or "member"))
+            return Results.BadRequest(new { error = "Role must be admin or member." });
+
+        // Customers register themselves and stay customers. Only staff change between member and admin.
+        if (target.Role == "customer")
+            return Results.BadRequest(new { error = "A customer's role cannot be changed." });
 
         // An organization must always keep at least one admin.
         if (target.Role == "admin" && role != "admin")
@@ -384,16 +390,45 @@ app.MapPatch("/admin/users/{id:int}", async (int id, UpdateUserRequest request, 
         target.Department = dept.Length == 0 ? null : dept;
     }
 
-    // Customers are outsiders and never belong to a department.
-    if (target.Role == "customer") target.Department = null;
+    // An admin may set or change the employee ID. It must be unique inside the organization.
+    if (request.EmployeeId is not null)
+    {
+        var employeeId = request.EmployeeId.Trim().ToUpperInvariant();
+        if (employeeId.Length > 20 ||
+            (employeeId.Length > 0 && !System.Text.RegularExpressions.Regex.IsMatch(employeeId, "^[A-Z0-9][A-Z0-9\\-_/]*$")))
+            return Results.BadRequest(new { error = "Employee ID can use letters, numbers, - _ and / (20 characters at most)." });
+
+        if (employeeId.Length > 0 &&
+            await db.Users.AnyAsync(u => u.OrgId == orgId && u.Id != id && u.EmployeeId == employeeId))
+            return Results.BadRequest(new { error = "That employee ID is already used by someone else." });
+
+        target.EmployeeId = employeeId.Length == 0 ? null : employeeId;
+    }
+
+    // Customers are outsiders: no department and no employee ID.
+    // Employees always have an ID: one is assigned if they don't have it yet.
+    if (target.Role == "customer")
+    {
+        target.Department = null;
+        target.EmployeeId = null;
+    }
+    else if (target.Role == "member" && string.IsNullOrEmpty(target.EmployeeId))
+    {
+        target.EmployeeId = await EmployeeIds.NextAsync(db, orgId);
+    }
 
     await db.SaveChangesAsync();
     await audit.LogAsync("USER_UPDATED", adminEmail, orgId,
-        new { userId = id, roleFrom = oldRole, roleTo = target.Role, departmentFrom = oldDepartment, departmentTo = target.Department });
+        new
+        {
+            userId = id,
+            roleFrom = oldRole, roleTo = target.Role,
+            departmentFrom = oldDepartment, departmentTo = target.Department,
+            employeeIdFrom = oldEmployeeId, employeeIdTo = target.EmployeeId
+        });
 
-    return Results.Ok(new { id, role = target.Role, department = target.Department });
+    return Results.Ok(new { id, role = target.Role, department = target.Department, employeeId = target.EmployeeId });
 }).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
-
 
 
 // Turns the AI engine's answer into a safe response for the browser.
@@ -458,7 +493,10 @@ app.MapGet("/admin/overview", async (ClaimsPrincipal user, OrgMindDbContext db) 
         .Select(a => new { eventType = a.EventType, userId = a.UserId, severity = a.Severity, timestamp = a.Timestamp })
         .ToListAsync();
 
-    return Results.Ok(new { usersByRole, newUsers, departments, ticketsByStatus, openByDepartment, recent });
+    var upsetOpen = await db.Tickets.CountAsync(t => t.OrgId == orgId && t.Sentiment == "negative"
+        && t.Status != "resolved" && t.Status != "closed");
+
+    return Results.Ok(new { usersByRole, newUsers, departments, ticketsByStatus, openByDepartment, upsetOpen, recent });
 }).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
 
 
@@ -817,7 +855,7 @@ public record PublicChatRequest(string? Message, string? OrgId);
 
 public record TicketStatusRequest(string? Status);
 
-public record UpdateUserRequest(string? Role, string? Department);
+record UpdateUserRequest(string? Role, string? Department, string? EmployeeId = null);
 
 public record DocLabelRequest(string? DocName, string? Visibility, string? Department);
 public record DocDeleteRequest(string? DocName);

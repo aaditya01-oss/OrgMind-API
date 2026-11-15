@@ -46,6 +46,7 @@ public class OrgMindDbContext : DbContext
             entity.Property(e => e.OrgId).HasColumnName("org_id");
             entity.Property(e => e.Role).HasColumnName("role");
             entity.Property(e => e.Department).HasColumnName("department");
+            entity.Property(e => e.EmployeeId).HasColumnName("employee_id");
             entity.Property(e => e.CreatedAt).HasColumnName("created_at");
         });
 
@@ -97,6 +98,7 @@ modelBuilder.Entity<Ticket>(entity =>
             entity.Property(e => e.CreatedAt).HasColumnName("created_at");
             entity.Property(e => e.UpdatedAt).HasColumnName("updated_at");
             entity.Property(e => e.Department).HasColumnName("department");
+            entity.Property(e => e.Sentiment).HasColumnName("sentiment");
         });
 
         

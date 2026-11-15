@@ -97,7 +97,8 @@ public class AuthService : IAuthService
                 PasswordHash = BCrypt.Net.BCrypt.HashPassword(password),
                 OrgId = invite.OrgId,
                 Role = invite.Role,
-                Department = invite.Department
+                Department = invite.Department,
+                EmployeeId = invite.Role == "member" ? await EmployeeIds.NextAsync(_context, invite.OrgId) : null
             };
             _context.Users.Add(user);
             await _context.SaveChangesAsync();

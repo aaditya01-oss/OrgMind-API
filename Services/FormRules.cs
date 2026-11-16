@@ -7,13 +7,13 @@ namespace OrgMind.API.Services;
 
 public record FormTemplateRequest(string? Name, string? Description, string? Audience, string? Department, JsonElement Fields, bool? Active);
 public record FormSubmitRequest(Dictionary<string, JsonElement>? Data);
-public record FormStatusRequest(string? Status);
+public record FormStatusRequest(string? Status, string? Note = null);
 
 // Who is asking, read from the signed token. Same claims the ticket endpoints use.
 public record Caller(string? OrgId, string? Email, string? Role, string? Department)
 {
     public bool IsAdmin => Role == "admin";
-    public bool IsDeptStaff => Role == "member" && Department != null;
+    public bool IsDeptStaff => Role == "member" && !string.IsNullOrWhiteSpace(Department);
     public bool IsKnown => !string.IsNullOrEmpty(OrgId) && !string.IsNullOrEmpty(Email);
 
     public static Caller From(ClaimsPrincipal user)

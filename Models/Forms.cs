@@ -26,6 +26,8 @@ public class FormSubmission
     public string Data { get; set; } = "{}";              // JSON object: question key -> answer
     public string Status { get; set; } = "new";
     public string? HandledBy { get; set; }
+
+    public string? StatusNote { get; set; }
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 }

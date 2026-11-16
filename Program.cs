@@ -22,6 +22,8 @@ builder.Services.AddHttpClient<IChatService, ChatService>();
 builder.Services.AddHttpClient<IDocumentService, DocumentService>();
 builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 25 * 1024 * 1024);
 builder.Services.AddScoped<IAuthService, AuthService>();
+builder.Services.AddSignalR();
+builder.Services.AddScoped<LiveNotifier>();
 builder.Services.AddSingleton<IAuditService, AuditService>();
 
 builder.Services.AddDbContext<OrgMindDbContext>(options =>
@@ -47,9 +49,19 @@ builder.Services
             NameClaimType = "email",
             RoleClaimType = "role"
         };
+        // Browsers can't put a header on a WebSocket, so the live connection sends the token in the address.
+        options.Events = new JwtBearerEvents
+        {
+            OnMessageReceived = context =>
+            {
+                var accessToken = context.Request.Query["access_token"];
+                if (!string.IsNullOrEmpty(accessToken) && context.HttpContext.Request.Path.StartsWithSegments("/hubs"))
+                    context.Token = accessToken;
+                return Task.CompletedTask;
+            }
+        };
     });
 builder.Services.AddAuthorization();
-
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("OrgMindPolicy", policy =>
@@ -298,7 +310,7 @@ app.MapGet("/tickets", async (ClaimsPrincipal user, OrgMindDbContext db) =>
         sentiment = t.Sentiment,
         department = t.Department,
         // Admins can change any ticket. A department's employees can change that department's tickets.
-        canManage = isAdmin || (isDeptStaff && t.Department == department),
+        canManage = t.CreatedBy != email && (isAdmin || (isDeptStaff && t.Department == department)),
         createdAt = t.CreatedAt
     }));
 }).RequireAuthorization().RequireRateLimiting("user");
@@ -323,6 +335,8 @@ app.MapPatch("/tickets/{id:int}/status", async (int id, TicketStatusRequest requ
     var allowed = role == "admin"
         || (role == "member" && department != null && ticket.Department == department);
     if (!allowed) return Results.StatusCode(403);
+    if (ticket.CreatedBy == email)
+        return Results.Json(new { error = "You cannot change the status of your own ticket. Someone else must handle it." }, statusCode: 403);
 
     var oldStatus = ticket.Status;
     ticket.Status = status;
@@ -499,7 +513,67 @@ app.MapGet("/admin/overview", async (ClaimsPrincipal user, OrgMindDbContext db) 
     return Results.Ok(new { usersByRole, newUsers, departments, ticketsByStatus, openByDepartment, upsetOpen, recent });
 }).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
 
+// ---- Admin: the audit log ------------------------------------------------------------
 
+app.MapGet("/admin/audit", async (string? type, string? user, DateTime? from, DateTime? to, bool? warnings, int? page,
+    ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var orgId = principal.FindFirst("orgId")?.Value;
+    if (string.IsNullOrEmpty(orgId)) return Results.Unauthorized();
+
+    var query = AuditQuery.Filter(db.AuditLogs.AsNoTracking(), orgId, type, user, from, to, warnings == true);
+    var total = await query.CountAsync();
+    var pageNumber = Math.Max(1, page ?? 1);
+    const int pageSize = 50;
+
+    var rows = await query.OrderByDescending(a => a.Timestamp).ThenByDescending(a => a.Id)
+        .Skip((pageNumber - 1) * pageSize).Take(pageSize).ToListAsync();
+
+    var types = await db.AuditLogs.AsNoTracking().Where(a => a.OrgId == orgId)
+        .Select(a => a.EventType).Distinct().OrderBy(t => t).ToListAsync();
+
+    return Results.Ok(new
+    {
+        total,
+        page = pageNumber,
+        pageSize,
+        types,
+        items = rows.Select(a => new
+        {
+            id = a.Id,
+            eventType = a.EventType,
+            userId = a.UserId,
+            severity = a.Severity,
+            timestamp = a.Timestamp,
+            details = AuditQuery.ParseDetails(a.Details)
+        })
+    });
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
+app.MapGet("/admin/audit/export", async (string? type, string? user, DateTime? from, DateTime? to, bool? warnings,
+    ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit) =>
+{
+    var orgId = principal.FindFirst("orgId")?.Value;
+    var email = principal.FindFirst("email")?.Value;
+    if (string.IsNullOrEmpty(orgId) || string.IsNullOrEmpty(email)) return Results.Unauthorized();
+
+    var rows = await AuditQuery.Filter(db.AuditLogs.AsNoTracking(), orgId, type, user, from, to, warnings == true)
+        .OrderByDescending(a => a.Timestamp).ThenByDescending(a => a.Id).Take(5000).ToListAsync();
+
+    var csv = new System.Text.StringBuilder("\uFEFFTime (UTC),Person,Event,Severity,Details\r\n");
+    foreach (var a in rows)
+    {
+        csv.Append(AuditQuery.CsvCell(a.Timestamp.ToString("yyyy-MM-dd HH:mm:ss"))).Append(',')
+           .Append(AuditQuery.CsvCell(a.UserId)).Append(',')
+           .Append(AuditQuery.CsvCell(a.EventType)).Append(',')
+           .Append(AuditQuery.CsvCell(a.Severity)).Append(',')
+           .Append(AuditQuery.CsvCell(a.Details)).Append("\r\n");
+    }
+
+    // Taking the log out of the system is itself recorded.
+    await audit.LogAsync("AUDIT_EXPORTED", email, orgId, new { rows = rows.Count });
+    return Results.File(System.Text.Encoding.UTF8.GetBytes(csv.ToString()), "text/csv", "audit-log.csv");
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
 // ===========================================================================
 // Forms: templates made by admins, submissions routed to a department.
 // Lists never include what people typed; only opening one submission does.
@@ -581,7 +655,8 @@ app.MapGet("/submissions", async (ClaimsPrincipal principal, OrgMindDbContext db
         submittedBy = s.SubmittedBy,
         department = s.Department,
         status = s.Status,
-        canManage = me.IsAdmin || (me.IsDeptStaff && s.Department == me.Department),
+        note = s.StatusNote,
+        canManage = s.SubmittedBy != me.Email && (me.IsAdmin || (me.IsDeptStaff && s.Department == me.Department && s.Status != "approved" && s.Status != "rejected" && s.Status != "done")),
         createdAt = s.CreatedAt
     }));
 }).RequireAuthorization().RequireRateLimiting("user");
@@ -603,6 +678,25 @@ app.MapGet("/submissions/{id:int}", async (int id, ClaimsPrincipal principal, Or
 
     var form = await db.FormTemplates.AsNoTracking().FirstOrDefaultAsync(f => f.Id == s.TemplateId && f.OrgId == me.OrgId);
 
+        // Sensitive answers are blanked for everyone except the person who sent them.
+    // The values only leave the server through the audited "reveal" endpoint below.
+    var fieldsJson = JsonSerializer.Deserialize<JsonElement>(form?.Fields ?? "[]");
+    var answers = JsonSerializer.Deserialize<Dictionary<string, string>>(s.Data) ?? new Dictionary<string, string>();
+    var masked = new List<string>();
+    if (s.SubmittedBy != me.Email && fieldsJson.ValueKind == JsonValueKind.Array)
+    {
+        foreach (var fld in fieldsJson.EnumerateArray())
+        {
+            if (fld.TryGetProperty("sensitive", out var sensitiveFlag) && sensitiveFlag.ValueKind == JsonValueKind.True
+                && fld.TryGetProperty("key", out var keyProp) && keyProp.GetString() is string fieldKey
+                && answers.ContainsKey(fieldKey))
+            {
+                answers[fieldKey] = "";
+                masked.Add(fieldKey);
+            }
+        }
+    }
+
     return Results.Ok(new
     {
         id = s.Id,
@@ -611,12 +705,52 @@ app.MapGet("/submissions/{id:int}", async (int id, ClaimsPrincipal principal, Or
         submittedBy = s.SubmittedBy,
         department = s.Department,
         status = s.Status,
+        note = s.StatusNote,
         handledBy = s.HandledBy,
-        canManage = me.IsAdmin || (me.IsDeptStaff && s.Department == me.Department),
+        canManage = s.SubmittedBy != me.Email && (me.IsAdmin || (me.IsDeptStaff && s.Department == me.Department && s.Status != "approved" && s.Status != "rejected" && s.Status != "done")),
         createdAt = s.CreatedAt,
-        fields = JsonSerializer.Deserialize<JsonElement>(form?.Fields ?? "[]"),
-        data = JsonSerializer.Deserialize<JsonElement>(s.Data)
+        fields = fieldsJson,
+        data = answers,
+        maskedKeys = masked
     });
+}).RequireAuthorization().RequireRateLimiting("user");
+
+
+// Show one sensitive answer. Only an admin or the handling department, and every reveal is recorded.
+app.MapPost("/submissions/{id:int}/reveal", async (int id, RevealRequest request, ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var s = await db.FormSubmissions.AsNoTracking().FirstOrDefaultAsync(x => x.Id == id && x.OrgId == me.OrgId);
+    var allowed = s is not null && (me.IsAdmin || (me.IsDeptStaff && s.Department == me.Department));
+    if (s is null || !allowed) return Results.NotFound(new { error = "Submission not found." });
+
+    var key = (request.Key ?? "").Trim();
+    var form = await db.FormTemplates.AsNoTracking().FirstOrDefaultAsync(x => x.Id == s.TemplateId && x.OrgId == me.OrgId);
+    var isSensitive = false;
+    if (form is not null)
+    {
+        var fieldList = JsonSerializer.Deserialize<JsonElement>(form.Fields ?? "[]");
+        if (fieldList.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var fld in fieldList.EnumerateArray())
+            {
+                if (fld.TryGetProperty("key", out var keyProp) && keyProp.GetString() == key
+                    && fld.TryGetProperty("sensitive", out var sensitiveFlag) && sensitiveFlag.ValueKind == JsonValueKind.True)
+                    isSensitive = true;
+            }
+        }
+    }
+
+    var answers = JsonSerializer.Deserialize<Dictionary<string, string>>(s.Data) ?? new Dictionary<string, string>();
+    if (!isSensitive || !answers.TryGetValue(key, out var value))
+        return Results.NotFound(new { error = "Answer not found." });
+
+    await audit.LogAsync("FORM_SENSITIVE_REVEALED", me.Email, me.OrgId,
+        new { submissionId = s.Id, formId = s.TemplateId, fieldKey = key, department = s.Department });
+
+    return Results.Ok(new { key, value });
 }).RequireAuthorization().RequireRateLimiting("user");
 
 // Change a submission's status: an admin, or an employee of the handling department.
@@ -629,14 +763,26 @@ app.MapPatch("/submissions/{id:int}/status", async (int id, FormStatusRequest re
     if (!FormRules.Statuses.Contains(status))
         return Results.BadRequest(new { error = "Status must be new, in_progress, approved, rejected or done." });
 
+    var note = (request.Note ?? "").Trim();
+    if (note.Length > 300)
+        return Results.BadRequest(new { error = "The reason is too long (300 characters at most)." });
+    if (status == "rejected" && note == "")
+        return Results.BadRequest(new { error = "Please give a short reason for rejecting." });
+
     var s = await db.FormSubmissions.FirstOrDefaultAsync(x => x.Id == id && x.OrgId == me.OrgId);
     if (s is null) return Results.NotFound(new { error = "Submission not found." });
 
     var allowed = me.IsAdmin || (me.IsDeptStaff && s.Department == me.Department);
     if (!allowed) return Results.StatusCode(403);
 
+    if (s.SubmittedBy == me.Email)
+        return Results.Json(new { error = "You cannot change the status of your own request. Someone else must handle it." }, statusCode: 403);
+    if ((s.Status == "approved" || s.Status == "rejected" || s.Status == "done") && !me.IsAdmin)
+        return Results.Json(new { error = "This request is already closed. Only an administrator can change it again." }, statusCode: 403);
+
     var oldStatus = s.Status;
     s.Status = status;
+    s.StatusNote = note == "" ? null : note;
     s.HandledBy = me.Email;
     s.UpdatedAt = DateTime.UtcNow;
     await db.SaveChangesAsync();
@@ -645,6 +791,306 @@ app.MapPatch("/submissions/{id:int}/status", async (int id, FormStatusRequest re
         new { submissionId = id, from = oldStatus, to = status, department = s.Department });
     return Results.Ok(new { id, status });
 }).RequireAuthorization().RequireRateLimiting("user");
+
+// ---- Conversations on tickets and submissions -------------------------------------
+
+app.MapGet("/threads/unread", async (ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var myTickets = db.Tickets.Where(t => t.OrgId == me.OrgId && t.CreatedBy == me.Email).Select(t => t.Id);
+    var mySubmissions = db.FormSubmissions.Where(s => s.OrgId == me.OrgId && s.SubmittedBy == me.Email).Select(s => s.Id);
+
+    var tickets = await db.ThreadMessages.AsNoTracking()
+        .Where(m => m.OrgId == me.OrgId && m.Kind == "ticket" && !m.ReadByOwner && m.Author != me.Email && myTickets.Contains(m.RefId))
+        .GroupBy(m => m.RefId).Select(g => new { refId = g.Key, count = g.Count() }).ToListAsync();
+    var submissions = await db.ThreadMessages.AsNoTracking()
+        .Where(m => m.OrgId == me.OrgId && m.Kind == "submission" && !m.ReadByOwner && m.Author != me.Email && mySubmissions.Contains(m.RefId))
+        .GroupBy(m => m.RefId).Select(g => new { refId = g.Key, count = g.Count() }).ToListAsync();
+
+    return Results.Ok(new { tickets, submissions });
+}).RequireAuthorization().RequireRateLimiting("user");
+
+app.MapGet("/threads/{kind}/{id:int}", async (string kind, int id, ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var access = await Threads.OpenAsync(db, me, kind, id);
+    if (access is null) return Results.NotFound(new { error = "Conversation not found." });
+
+    var messages = await db.ThreadMessages
+        .Where(m => m.OrgId == me.OrgId && m.Kind == kind && m.RefId == id)
+        .OrderBy(m => m.CreatedAt).ThenBy(m => m.Id).ToListAsync();
+
+    // The owner opening the conversation counts as reading it.
+    if (access.IsOwner)
+    {
+        var unread = messages.Where(m => m.Author != me.Email && !m.ReadByOwner).ToList();
+        if (unread.Count > 0)
+        {
+            foreach (var m in unread) m.ReadByOwner = true;
+            await db.SaveChangesAsync();
+        }
+    }
+
+    return Results.Ok(new
+    {
+        isStaff = access.IsStaff,
+        closed = access.IsClosed,
+        canReply = access.IsStaff || (access.IsOwner && !access.IsClosed),
+        messages = messages.Select(m => new
+        {
+            id = m.Id,
+            // The owner never sees the email of the staff member who answered.
+            author = (access.IsOwner && m.Author != access.Owner) ? "Support team" : m.Author,
+            fromYou = m.Author == me.Email,
+            body = m.Body,
+            createdAt = m.CreatedAt
+        })
+    });
+}).RequireAuthorization().RequireRateLimiting("user");
+
+app.MapPost("/threads/{kind}/{id:int}", async (string kind, int id, ThreadPostRequest request, ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit, LiveNotifier live) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var access = await Threads.OpenAsync(db, me, kind, id);
+    if (access is null) return Results.NotFound(new { error = "Conversation not found." });
+
+    var body = (request.Body ?? "").Trim();
+    if (body.Length == 0) return Results.BadRequest(new { error = "Please write a message." });
+    if (body.Length > Threads.MaxLength)
+        return Results.BadRequest(new { error = $"The message is too long ({Threads.MaxLength} characters at most)." });
+
+    var allowed = access.IsStaff || (access.IsOwner && !access.IsClosed);
+    if (!allowed)
+        return Results.Json(new { error = access.IsOwner ? "This conversation is closed." : "You cannot write here." }, statusCode: 403);
+
+    db.ThreadMessages.Add(new ThreadMessage
+    {
+        OrgId = me.OrgId!,
+        Kind = kind,
+        RefId = id,
+        Author = me.Email!,
+        Body = body,
+        ReadByOwner = access.IsOwner
+    });
+    await db.SaveChangesAsync();
+
+    // The audit log records that a message was sent, never what it said.
+    await audit.LogAsync("THREAD_MESSAGE_POSTED", me.Email, me.OrgId,
+        new { kind, refId = id, department = access.Department, fromOwner = access.IsOwner });
+        var payload = new { area = "thread", kind, id };
+    if (access.IsOwner)
+    {
+        // The owner wrote: the handling team hears about it.
+        await live.ToDepartment(me.OrgId!, access.Department, me.Email!, payload);
+    }
+    else
+    {
+        // Staff wrote: the owner and the rest of the team hear about it.
+        await live.ToPerson(me.OrgId!, access.Owner, payload);
+        await live.ToDepartment(me.OrgId!, access.Department, me.Email!, payload);
+    }
+    return Results.Ok(new { posted = true });
+}).RequireAuthorization().RequireRateLimiting("chat");
+
+// The signed-in person's own details.
+app.MapGet("/me", async (ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var user = await db.Users.AsNoTracking().FirstOrDefaultAsync(u => u.Email == me.Email && u.OrgId == me.OrgId);
+    if (user is null) return Results.NotFound(new { error = "Account not found." });
+
+    return Results.Ok(new
+    {
+        email = user.Email,
+        role = user.Role,
+        department = user.Department,
+        employeeId = user.EmployeeId,
+        orgId = user.OrgId
+    });
+}).RequireAuthorization().RequireRateLimiting("user");
+
+// ---- Staff messages: direct and department groups ----------------------------------
+
+app.MapGet("/chat/directory", async (ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+    if (!StaffChat.IsStaff(me)) return Results.StatusCode(403);
+
+    var people = await db.Users.AsNoTracking()
+        .Where(u => u.OrgId == me.OrgId && (u.Role == "admin" || u.Role == "member") && u.Email != me.Email)
+        .OrderBy(u => u.Email)
+        .Select(u => new { email = u.Email, role = u.Role, department = u.Department, employeeId = u.EmployeeId })
+        .ToListAsync();
+    return Results.Ok(people);
+}).RequireAuthorization().RequireRateLimiting("user");
+
+app.MapGet("/chat/channels", async (ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+    if (!StaffChat.IsStaff(me)) return Results.StatusCode(403);
+
+    // An employee has their own department's group; an admin has every department's.
+    List<string> deptNames;
+    if (me.IsAdmin)
+        deptNames = await db.Users.AsNoTracking()
+            .Where(u => u.OrgId == me.OrgId && u.Role == "member" && u.Department != null && u.Department != "")
+            .Select(u => u.Department!.ToLower()).Distinct().ToListAsync();
+    else
+        deptNames = me.IsDeptStaff ? new List<string> { me.Department!.ToLower() } : new List<string>();
+    deptNames.Sort();
+
+    var reads = await db.StaffReads.AsNoTracking()
+        .Where(r => r.OrgId == me.OrgId && r.UserEmail == me.Email)
+        .ToDictionaryAsync(r => r.Channel, r => r.LastReadId);
+
+    async Task<(int Unread, DateTime? Last)> Stats(string channel)
+    {
+        var lastRead = reads.TryGetValue(channel, out var v) ? v : 0;
+        var unread = await db.StaffMessages.CountAsync(m =>
+            m.OrgId == me.OrgId && m.Channel == channel && m.Id > lastRead && m.Author != me.Email);
+        var last = await db.StaffMessages.Where(m => m.OrgId == me.OrgId && m.Channel == channel)
+            .MaxAsync(m => (DateTime?)m.CreatedAt);
+        return (unread, last);
+    }
+
+    var total = 0;
+    var departments = new List<object>();
+    foreach (var d in deptNames)
+    {
+        var (unread, last) = await Stats(StaffChat.DeptKey(d));
+        total += unread;
+        departments.Add(new { name = d, unread, lastAt = last });
+    }
+
+    var dmPrefix = "dm:" + me.Email + "|";
+    var dmSuffix = "|" + me.Email;
+    var dmChannels = await db.StaffMessages.AsNoTracking()
+        .Where(m => m.OrgId == me.OrgId && (m.Channel.StartsWith(dmPrefix) || m.Channel.EndsWith(dmSuffix)))
+        .Select(m => m.Channel).Distinct().ToListAsync();
+
+    var direct = new List<(string Person, int Unread, DateTime? Last)>();
+    foreach (var c in dmChannels.Where(c => c.StartsWith("dm:")))
+    {
+        var other = c.Substring(3).Split('|').First(e => e != me.Email);
+        var (unread, last) = await Stats(c);
+        total += unread;
+        direct.Add((other, unread, last));
+    }
+
+    return Results.Ok(new
+    {
+        departments,
+        direct = direct.OrderByDescending(x => x.Last).Select(x => new { person = x.Person, unread = x.Unread, lastAt = x.Last }),
+        total
+    });
+}).RequireAuthorization().RequireRateLimiting("user");
+
+app.MapGet("/chat/direct", async (string person, ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var channel = await StaffChat.DirectChannelAsync(db, me, person);
+    if (channel is null) return Results.NotFound(new { error = "Conversation not found." });
+    return Results.Ok(await StaffChat.ReadAsync(db, me, channel));
+}).RequireAuthorization().RequireRateLimiting("user");
+
+app.MapPost("/chat/direct", async (ChatPostRequest request, ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit, LiveNotifier live) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var channel = await StaffChat.DirectChannelAsync(db, me, request.To);
+    if (channel is null) return Results.NotFound(new { error = "Conversation not found." });
+
+    var error = await StaffChat.PostAsync(db, me, channel, request.Body);
+    if (error is not null) return Results.BadRequest(new { error });
+
+    // Recorded: that a message was sent. Never the text, and not who it went to.
+    await audit.LogAsync("STAFF_MESSAGE_SENT", me.Email, me.OrgId, new { kind = "direct" });
+    await live.ToPerson(me.OrgId!, request.To!.Trim().ToLowerInvariant(), new { area = "chat" });
+    return Results.Ok(new { posted = true });
+}).RequireAuthorization().RequireRateLimiting("user");
+
+app.MapGet("/chat/department", async (string name, ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var channel = await StaffChat.DepartmentChannelAsync(db, me, name);
+    if (channel is null) return Results.NotFound(new { error = "Conversation not found." });
+    return Results.Ok(await StaffChat.ReadAsync(db, me, channel));
+}).RequireAuthorization().RequireRateLimiting("user");
+
+app.MapPost("/chat/department", async (ChatPostRequest request, ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit, LiveNotifier live) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var channel = await StaffChat.DepartmentChannelAsync(db, me, request.To);
+    if (channel is null) return Results.NotFound(new { error = "Conversation not found." });
+
+    var error = await StaffChat.PostAsync(db, me, channel, request.Body);
+    if (error is not null) return Results.BadRequest(new { error });
+
+    await audit.LogAsync("STAFF_MESSAGE_SENT", me.Email, me.OrgId,
+        new { kind = "department", department = channel.Substring(5) });
+    await live.ToDepartment(me.OrgId!, request.To, me.Email!, new { area = "chat" });
+    return Results.Ok(new { posted = true });
+}).RequireAuthorization().RequireRateLimiting("user");
+
+// Fellow employees in my own department. Only email and employee ID are shown, and only inside my department.
+app.MapGet("/team", async (ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    if (!me.IsDeptStaff)
+        return Results.Ok(new { department = (string?)null, members = new List<object>() });
+
+    var members = await db.Users.AsNoTracking()
+        .Where(u => u.OrgId == me.OrgId && u.Role == "member" && u.Department == me.Department)
+        .OrderBy(u => u.EmployeeId).ThenBy(u => u.Email)
+        .Select(u => new { email = u.Email, employeeId = u.EmployeeId, isYou = u.Email == me.Email })
+        .ToListAsync();
+
+    return Results.Ok(new { department = me.Department, members });
+}).RequireAuthorization().RequireRateLimiting("user");
+
+// Change your own password. The current password must be right (the "auth" limit stops guessing).
+app.MapPost("/me/password", async (ChangePasswordRequest request, ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var current = request.CurrentPassword ?? "";
+    var next = request.NewPassword ?? "";
+    if (next.Length < 8 || next.Length > 72)
+        return Results.BadRequest(new { error = "The new password must be 8 to 72 characters long." });
+    if (next == current)
+        return Results.BadRequest(new { error = "The new password must be different from the current one." });
+
+    var user = await db.Users.FirstOrDefaultAsync(u => u.Email == me.Email && u.OrgId == me.OrgId);
+    if (user is null || !BCrypt.Net.BCrypt.Verify(current, user.PasswordHash))
+        return Results.BadRequest(new { error = "The current password is not correct." });
+
+    user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(next);
+    await db.SaveChangesAsync();
+
+    // The audit log records that it happened, never any password.
+    await audit.LogAsync("PASSWORD_CHANGED", me.Email, me.OrgId, new { });
+    return Results.Ok(new { changed = true });
+}).RequireAuthorization().RequireRateLimiting("auth");
 
 // ---- Admin: manage form templates --------------------------------------------------
 
@@ -742,6 +1188,48 @@ app.MapGet("/admin/documents", async (ClaimsPrincipal user, IDocumentService doc
     var (status, body) = await docs.ListAsync(orgId);
     return EngineResult(status, body, "The document service could not list the documents.");
 }).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
+// Staff library: read-only list of the documents this person is allowed to use.
+// Admins see all; an employee sees public, registered, internal, and their own department's.
+app.MapGet("/library", async (ClaimsPrincipal principal, IDocumentService docs) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+    if (!StaffChat.IsStaff(me)) return Results.StatusCode(403);
+
+    var (status, body) = await docs.ListAsync(me.OrgId!);
+    if (status < 200 || status >= 300)
+        return EngineResult(status, body, "The document service could not list the documents.");
+
+    var myDept = (me.Department ?? "").Trim().ToLowerInvariant();
+    var items = new List<object>();
+    using var json = JsonDocument.Parse(body);
+    if (json.RootElement.TryGetProperty("documents", out var arr) && arr.ValueKind == JsonValueKind.Array)
+    {
+        foreach (var d in arr.EnumerateArray())
+        {
+            var name = d.TryGetProperty("doc_name", out var n) ? n.GetString() : null;
+            if (string.IsNullOrEmpty(name)) continue;
+            var visibility = d.TryGetProperty("visibility", out var v) ? v.GetString() : "internal";
+            var dept = d.TryGetProperty("department", out var dp) && dp.ValueKind == JsonValueKind.String
+                ? (dp.GetString() ?? "").Trim().ToLowerInvariant() : "";
+
+            var allowed = me.IsAdmin
+                || visibility is "public" or "registered" or "internal"
+                || (visibility == "department" && dept != "" && dept == myDept);
+            if (!allowed) continue;
+
+            items.Add(new
+            {
+                name,
+                visibility,
+                department = dept == "" ? null : dept,
+                chunks = d.TryGetProperty("chunks", out var c) && c.ValueKind == JsonValueKind.Number ? c.GetInt32() : 0
+            });
+        }
+    }
+    return Results.Ok(items.OrderBy(i => ((dynamic)i).name));
+}).RequireAuthorization().RequireRateLimiting("user");
 
 app.MapPost("/admin/documents/relabel", async (DocLabelRequest request, ClaimsPrincipal user, IDocumentService docs) =>
 {
@@ -848,6 +1336,8 @@ app.MapPost("/documents/ocr", (HttpRequest http, ClaimsPrincipal user, IDocument
     HandleUpload(http, user, docs, "/documents/ocr", new[] { ".pdf", ".png", ".jpg", ".jpeg" }))
     .RequireAuthorization().RequireRateLimiting("chat");
 
+app.MapHub<LiveHub>("/hubs/live").RequireAuthorization();
+
 app.Run();
 
 public record RegisterCustomerRequest(string? Email, string? Password, string? OrgId);
@@ -857,5 +1347,14 @@ public record TicketStatusRequest(string? Status);
 
 record UpdateUserRequest(string? Role, string? Department, string? EmployeeId = null);
 
+record RevealRequest(string? Key);
+
+record ChangePasswordRequest(string? CurrentPassword, string? NewPassword);
+
+record ThreadPostRequest(string? Body);
+
+record ChatPostRequest(string? To, string? Body);
+
 public record DocLabelRequest(string? DocName, string? Visibility, string? Department);
 public record DocDeleteRequest(string? DocName);
+

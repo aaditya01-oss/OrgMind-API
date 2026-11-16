@@ -20,6 +20,10 @@ public class OrgMindDbContext : DbContext
 
     public DbSet<FormTemplate> FormTemplates { get; set; }
     public DbSet<FormSubmission> FormSubmissions { get; set; }
+    public DbSet<ThreadMessage> ThreadMessages { get; set; }
+
+    public DbSet<StaffMessage> StaffMessages { get; set; }
+    public DbSet<StaffRead> StaffReads { get; set; }
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -134,6 +138,45 @@ modelBuilder.Entity<Ticket>(entity =>
             entity.Property(e => e.HandledBy).HasColumnName("handled_by");
             entity.Property(e => e.CreatedAt).HasColumnName("created_at");
             entity.Property(e => e.UpdatedAt).HasColumnName("updated_at");
+            entity.Property(e => e.StatusNote).HasColumnName("status_note");
+        });
+
+        modelBuilder.Entity<ThreadMessage>(entity =>
+        {
+            entity.ToTable("thread_messages");
+            entity.HasKey(e => e.Id);
+            entity.Property(e => e.Id).HasColumnName("id");
+            entity.Property(e => e.OrgId).HasColumnName("org_id");
+            entity.Property(e => e.Kind).HasColumnName("kind");
+            entity.Property(e => e.RefId).HasColumnName("ref_id");
+            entity.Property(e => e.Author).HasColumnName("author");
+            entity.Property(e => e.Body).HasColumnName("body");
+            entity.Property(e => e.ReadByOwner).HasColumnName("read_by_owner");
+            entity.Property(e => e.CreatedAt).HasColumnName("created_at")
+                  .HasDefaultValueSql("(NOW() AT TIME ZONE 'UTC')").ValueGeneratedOnAdd();
+        });
+
+            modelBuilder.Entity<StaffMessage>(entity =>
+        {
+            entity.ToTable("staff_messages");
+            entity.HasKey(e => e.Id);
+            entity.Property(e => e.Id).HasColumnName("id");
+            entity.Property(e => e.OrgId).HasColumnName("org_id");
+            entity.Property(e => e.Channel).HasColumnName("channel");
+            entity.Property(e => e.Author).HasColumnName("author");
+            entity.Property(e => e.Body).HasColumnName("body");
+            entity.Property(e => e.CreatedAt).HasColumnName("created_at")
+                  .HasDefaultValueSql("(NOW() AT TIME ZONE 'UTC')").ValueGeneratedOnAdd();
+        });
+
+        modelBuilder.Entity<StaffRead>(entity =>
+        {
+            entity.ToTable("staff_reads");
+            entity.HasKey(e => new { e.OrgId, e.UserEmail, e.Channel });
+            entity.Property(e => e.OrgId).HasColumnName("org_id");
+            entity.Property(e => e.UserEmail).HasColumnName("user_email");
+            entity.Property(e => e.Channel).HasColumnName("channel");
+            entity.Property(e => e.LastReadId).HasColumnName("last_read_id");
         });
     }
 }

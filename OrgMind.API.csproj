@@ -19,4 +19,11 @@
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.6.2" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Remove="OrgMind.Tests\**" />
+    <Content Remove="OrgMind.Tests\**" />
+    <EmbeddedResource Remove="OrgMind.Tests\**" />
+    <None Remove="OrgMind.Tests\**" />
+  </ItemGroup>
+
 </Project>

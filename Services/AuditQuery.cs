@@ -20,8 +20,17 @@ public static class AuditQuery
             query = query.Where(a => a.UserId != null && a.UserId.ToLower().Contains(u));
         }
 
-        if (from is not null) query = query.Where(a => a.Timestamp >= from.Value.Date);
-        if (to is not null) query = query.Where(a => a.Timestamp < to.Value.Date.AddDays(1));
+                // The log stores UTC, and the database driver only accepts dates marked as UTC.
+        if (from is not null)
+        {
+            var start = DateTime.SpecifyKind(from.Value.Date, DateTimeKind.Utc);
+            query = query.Where(a => a.Timestamp >= start);
+        }
+        if (to is not null)
+        {
+            var end = DateTime.SpecifyKind(to.Value.Date.AddDays(1), DateTimeKind.Utc);
+            query = query.Where(a => a.Timestamp < end);
+        }
         if (warningsOnly) query = query.Where(a => a.Severity != null && a.Severity != "INFO");
 
         return query;

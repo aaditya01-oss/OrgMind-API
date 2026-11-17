@@ -290,6 +290,7 @@ app.MapGet("/tickets", async (ClaimsPrincipal user, OrgMindDbContext db) =>
 
     var isAdmin = role == "admin";
     var isDeptStaff = role == "member" && department != null;
+    var me = Caller.From(user);
 
     var query = db.Tickets.AsNoTracking().Where(t => t.OrgId == orgId);
     if (!isAdmin)
@@ -310,7 +311,7 @@ app.MapGet("/tickets", async (ClaimsPrincipal user, OrgMindDbContext db) =>
         sentiment = t.Sentiment,
         department = t.Department,
         // Admins can change any ticket. A department's employees can change that department's tickets.
-        canManage = t.CreatedBy != email && (isAdmin || (isDeptStaff && t.Department == department)),
+        canManage = AccessRules.CanManageTicket(me, t.CreatedBy, t.Department),
         createdAt = t.CreatedAt
     }));
 }).RequireAuthorization().RequireRateLimiting("user");
@@ -332,9 +333,8 @@ app.MapPatch("/tickets/{id:int}/status", async (int id, TicketStatusRequest requ
     var ticket = await db.Tickets.FirstOrDefaultAsync(t => t.Id == id && t.OrgId == orgId);
     if (ticket is null) return Results.NotFound(new { error = "Ticket not found." });
 
-    var allowed = role == "admin"
-        || (role == "member" && department != null && ticket.Department == department);
-    if (!allowed) return Results.StatusCode(403);
+     var me = Caller.From(user);
+    if (!AccessRules.IsTicketHandler(me, ticket.Department)) return Results.StatusCode(403);
     if (ticket.CreatedBy == email)
         return Results.Json(new { error = "You cannot change the status of your own ticket. Someone else must handle it." }, statusCode: 403);
 
@@ -656,7 +656,7 @@ app.MapGet("/submissions", async (ClaimsPrincipal principal, OrgMindDbContext db
         department = s.Department,
         status = s.Status,
         note = s.StatusNote,
-        canManage = s.SubmittedBy != me.Email && (me.IsAdmin || (me.IsDeptStaff && s.Department == me.Department && s.Status != "approved" && s.Status != "rejected" && s.Status != "done")),
+        canManage = AccessRules.CanManageSubmission(me, s.SubmittedBy, s.Department, s.Status),
         createdAt = s.CreatedAt
     }));
 }).RequireAuthorization().RequireRateLimiting("user");
@@ -668,8 +668,7 @@ app.MapGet("/submissions/{id:int}", async (int id, ClaimsPrincipal principal, Or
     if (!me.IsKnown) return Results.Unauthorized();
 
     var s = await db.FormSubmissions.AsNoTracking().FirstOrDefaultAsync(x => x.Id == id && x.OrgId == me.OrgId);
-    var allowed = s is not null &&
-        (me.IsAdmin || s.SubmittedBy == me.Email || (me.IsDeptStaff && s.Department == me.Department));
+    var allowed = s is not null && AccessRules.CanSeeSubmission(me, s.SubmittedBy, s.Department);
     if (s is null || !allowed) return Results.NotFound(new { error = "Submission not found." });   // same answer for "missing" and "not yours"
 
     if (s.SubmittedBy != me.Email)
@@ -707,7 +706,7 @@ app.MapGet("/submissions/{id:int}", async (int id, ClaimsPrincipal principal, Or
         status = s.Status,
         note = s.StatusNote,
         handledBy = s.HandledBy,
-        canManage = s.SubmittedBy != me.Email && (me.IsAdmin || (me.IsDeptStaff && s.Department == me.Department && s.Status != "approved" && s.Status != "rejected" && s.Status != "done")),
+        canManage = AccessRules.CanManageSubmission(me, s.SubmittedBy, s.Department, s.Status),
         createdAt = s.CreatedAt,
         fields = fieldsJson,
         data = answers,
@@ -723,7 +722,7 @@ app.MapPost("/submissions/{id:int}/reveal", async (int id, RevealRequest request
     if (!me.IsKnown) return Results.Unauthorized();
 
     var s = await db.FormSubmissions.AsNoTracking().FirstOrDefaultAsync(x => x.Id == id && x.OrgId == me.OrgId);
-    var allowed = s is not null && (me.IsAdmin || (me.IsDeptStaff && s.Department == me.Department));
+    var allowed = s is not null && AccessRules.CanRevealAnswer(me, s.Department);
     if (s is null || !allowed) return Results.NotFound(new { error = "Submission not found." });
 
     var key = (request.Key ?? "").Trim();
@@ -772,12 +771,11 @@ app.MapPatch("/submissions/{id:int}/status", async (int id, FormStatusRequest re
     var s = await db.FormSubmissions.FirstOrDefaultAsync(x => x.Id == id && x.OrgId == me.OrgId);
     if (s is null) return Results.NotFound(new { error = "Submission not found." });
 
-    var allowed = me.IsAdmin || (me.IsDeptStaff && s.Department == me.Department);
-    if (!allowed) return Results.StatusCode(403);
+    if (!AccessRules.IsSubmissionHandler(me, s.Department)) return Results.StatusCode(403);
 
     if (s.SubmittedBy == me.Email)
         return Results.Json(new { error = "You cannot change the status of your own request. Someone else must handle it." }, statusCode: 403);
-    if ((s.Status == "approved" || s.Status == "rejected" || s.Status == "done") && !me.IsAdmin)
+    if (AccessRules.IsClosedSubmission(s.Status) && !me.IsAdmin)
         return Results.Json(new { error = "This request is already closed. Only an administrator can change it again." }, statusCode: 403);
 
     var oldStatus = s.Status;

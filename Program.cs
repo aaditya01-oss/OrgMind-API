@@ -24,6 +24,7 @@ builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 25 * 1024 * 
 builder.Services.AddScoped<IAuthService, AuthService>();
 builder.Services.AddSignalR();
 builder.Services.AddScoped<LiveNotifier>();
+builder.Services.AddHttpClient<ITurnstileVerifier, TurnstileVerifier>(c => c.Timeout = TimeSpan.FromSeconds(5));
 builder.Services.AddSingleton<IAuditService, AuditService>();
 
 builder.Services.AddDbContext<OrgMindDbContext>(options =>
@@ -131,6 +132,8 @@ builder.Services.AddRateLimiter(options =>
 });
 
 var app = builder.Build();
+if (string.IsNullOrWhiteSpace(builder.Configuration["TurnstileSecretKey"]))
+    app.Logger.LogWarning("TurnstileSecretKey is not set: customer sign-up is NOT protected against bots.");
 
 app.UseHttpsRedirection();
 app.UseCors("OrgMindPolicy");
@@ -203,16 +206,25 @@ app.MapPost("/auth/register", async (RegisterRequest request, IAuthService authS
     return Results.Ok(new AuthResponse { Token = result.Token!, Email = email, OrgId = result.OrgId!, Role = result.Role! });
 }).RequireRateLimiting("auth");
 
-app.MapPost("/auth/register-customer", async (RegisterCustomerRequest request, IAuthService authService, IAuditService audit, HttpContext http) =>
+app.MapPost("/auth/register-customer", async (RegisterCustomerRequest request, IAuthService authService, IAuditService audit, ITurnstileVerifier turnstile, OrgMindDbContext db, HttpContext http) =>
 {
     var ip = http.Connection.RemoteIpAddress?.ToString();
     var emailInput = request.Email ?? "";
     var email = emailInput.Trim().ToLowerInvariant();
+    var requestedOrg = (request.OrgId ?? "").Trim();
+    var knownOrg = await db.Organizations.AsNoTracking()
+    .Where(o => o.Id == requestedOrg).Select(o => o.Id).FirstOrDefaultAsync();
+
+    if (!await turnstile.VerifyAsync(request.CaptchaToken, ip))
+    {
+                await audit.LogAsync("REGISTER_FAILED", email, knownOrg, new { reason = "captcha", method = "customer", ip }, "WARNING");
+        return Results.BadRequest(new { error = "Please complete the human check and try again." });
+    }
     var result = await authService.RegisterCustomerAsync(emailInput, request.Password ?? "", request.OrgId ?? "");
 
     if (!result.Success)
     {
-        await audit.LogAsync("REGISTER_FAILED", email, null, new { reason = result.Error, method = "customer", ip }, "WARNING");
+                await audit.LogAsync("REGISTER_FAILED", email, knownOrg, new { reason = result.Error, method = "customer", ip }, "WARNING");
         return Results.BadRequest(new { error = result.Error });
     }
 
@@ -256,16 +268,20 @@ app.MapPost("/orgs/invites", async (CreateInviteRequest request, ClaimsPrincipal
     return Results.Ok(new { code, expiresAt });
 }).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
 
-app.MapPost("/auth/login", async (LoginRequest request, IAuthService authService, IAuditService audit, HttpContext http) =>
+app.MapPost("/auth/login", async (LoginRequest request, IAuthService authService, IAuditService audit, OrgMindDbContext db, HttpContext http) =>
 {
     var ip = http.Connection.RemoteIpAddress?.ToString();
         var emailInput = request.Email ?? "";
     var email = emailInput.Trim().ToLowerInvariant();
     var token = await authService.LoginAsync(emailInput, request.Password ?? "");
 
-    if (token == null)
+        if (token == null)
     {
-        await audit.LogAsync("LOGIN_FAILED", email, null, new { ip }, "WARNING");
+        // File the failed attempt under the company of the account that was targeted (if it exists),
+        // so that company's admins can see it.
+        var targetOrg = await db.Users.AsNoTracking()
+            .Where(u => u.Email.ToLower() == email).Select(u => u.OrgId).FirstOrDefaultAsync();
+        await audit.LogAsync("LOGIN_FAILED", email, targetOrg, new { ip }, "WARNING");
         return Results.Unauthorized();
     }
 
@@ -1372,7 +1388,7 @@ app.MapHub<LiveHub>("/hubs/live").RequireAuthorization();
 
 app.Run();
 
-public record RegisterCustomerRequest(string? Email, string? Password, string? OrgId);
+public record RegisterCustomerRequest(string? Email, string? Password, string? OrgId, string? CaptchaToken = null);
 public record PublicChatRequest(string? Message, string? OrgId);
 
 public record TicketStatusRequest(string? Status);

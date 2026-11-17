@@ -1177,6 +1177,40 @@ app.MapPut("/admin/forms/{id:int}", async (int id, FormTemplateRequest request, 
     return Results.Ok(new { id });
 }).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
 
+// ---- Admin: company details and settings ------------------------------------------------
+
+app.MapGet("/admin/company", async (ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var org = await db.Organizations.AsNoTracking().FirstOrDefaultAsync(o => o.Id == me.OrgId);
+    if (org is null) return Results.NotFound(new { error = "Company not found." });
+
+    var staff = await db.Users.CountAsync(u => u.OrgId == me.OrgId && (u.Role == "admin" || u.Role == "member"));
+    var customers = await db.Users.CountAsync(u => u.OrgId == me.OrgId && u.Role == "customer");
+
+    return Results.Ok(new { orgId = org.Id, name = org.Name, allowCustomerSignup = org.AllowCustomerSignup, staff, customers });
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
+app.MapPatch("/admin/company", async (CompanySettingsRequest request, ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+    if (request.AllowCustomerSignup is null) return Results.BadRequest(new { error = "Nothing to change." });
+
+    var org = await db.Organizations.FirstOrDefaultAsync(o => o.Id == me.OrgId);
+    if (org is null) return Results.NotFound(new { error = "Company not found." });
+
+    var before = org.AllowCustomerSignup;
+    org.AllowCustomerSignup = request.AllowCustomerSignup.Value;
+    await db.SaveChangesAsync();
+
+    await audit.LogAsync("COMPANY_SETTINGS_CHANGED", me.Email, me.OrgId,
+        new { setting = "allow_customer_signup", from = before, to = org.AllowCustomerSignup });
+    return Results.Ok(new { allowCustomerSignup = org.AllowCustomerSignup });
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
 // Admin: the knowledge base of THIS organization (the organization comes from the token).
 app.MapGet("/admin/documents", async (ClaimsPrincipal user, IDocumentService docs) =>
 {
@@ -1352,6 +1386,7 @@ record ChangePasswordRequest(string? CurrentPassword, string? NewPassword);
 record ThreadPostRequest(string? Body);
 
 record ChatPostRequest(string? To, string? Body);
+record CompanySettingsRequest(bool? AllowCustomerSignup);
 
 public record DocLabelRequest(string? DocName, string? Visibility, string? Department);
 public record DocDeleteRequest(string? DocName);

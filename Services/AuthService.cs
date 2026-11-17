@@ -40,9 +40,10 @@ public class AuthService : IAuthService
         email = email.Trim().ToLowerInvariant();
         orgId = (orgId ?? string.Empty).Trim();
 
-        // Same wording whether the org is missing or not, so nobody can probe which org ids exist.
-        if (orgId.Length == 0 || !await _context.Organizations.AnyAsync(o => o.Id == orgId))
-            return new AuthResult(false, Error: "We couldn't find that organization.");
+        // Same wording whether the org is missing or has closed sign-up, so nobody can probe which org ids exist.
+        var org = orgId.Length == 0 ? null : await _context.Organizations.AsNoTracking().FirstOrDefaultAsync(o => o.Id == orgId);
+        if (org is null || !org.AllowCustomerSignup)
+            return new AuthResult(false, Error: "Sign-up isn't available for this link. Please contact the organization.");
 
         if (await _context.Users.AnyAsync(u => u.Email.ToLower() == email))
             return new AuthResult(false, Error: "That email is already registered.");

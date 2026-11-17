@@ -39,7 +39,7 @@ public static class FormRules
     // Which forms each kind of signed-in person may see and fill.
     public static string[] AudiencesFor(string? role) => role switch
     {
-        "admin" => new[] { "customer", "employee", "public" },
+        "admin" => new[] { "employee", "public" },
         "member" => new[] { "employee", "public" },
         "customer" => new[] { "customer", "public" },
         _ => Array.Empty<string>()

@@ -268,7 +268,8 @@ CREATE TABLE public.invites (
 CREATE TABLE public.organizations (
     id text NOT NULL,
     name text NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    allow_customer_signup boolean DEFAULT true NOT NULL
 );
 
 

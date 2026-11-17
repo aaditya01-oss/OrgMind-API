@@ -57,6 +57,7 @@ public class OrgMindDbContext : DbContext
         modelBuilder.Entity<Organization>(entity =>
         {
         entity.ToTable("organizations");
+        entity.Property(o => o.AllowCustomerSignup).HasColumnName("allow_customer_signup");
         entity.HasKey(e => e.Id);
         entity.Property(e => e.Id).HasColumnName("id");
         entity.Property(e => e.Name).HasColumnName("name");

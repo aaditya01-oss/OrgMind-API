@@ -124,4 +124,12 @@ public class AccessRulesTests
         Assert.False(AccessRules.CanRevealAnswer(Employee("ram@acme.test", null), "loans"));
         Assert.False(AccessRules.CanRevealAnswer(Customer("maya@customer.test"), "loans"));
     }
+        [Fact]
+    public void Admin_fills_staff_and_public_forms_but_not_customer_forms()
+    {
+        var forms = FormRules.AudiencesFor("admin");
+        Assert.Contains("employee", forms);
+        Assert.Contains("public", forms);
+        Assert.DoesNotContain("customer", forms);
+    }
 }

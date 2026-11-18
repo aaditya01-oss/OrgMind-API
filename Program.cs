@@ -375,7 +375,7 @@ app.MapGet("/admin/users", async (ClaimsPrincipal user, OrgMindDbContext db) =>
     var users = await db.Users.AsNoTracking()
         .Where(u => u.OrgId == orgId)
         .OrderBy(u => u.Id)
-        .Select(u => new { id = u.Id, email = u.Email, role = u.Role, department = u.Department, employeeId = u.EmployeeId, createdAt = u.CreatedAt })
+                .Select(u => new { id = u.Id, email = u.Email, role = u.Role, department = u.Department, employeeId = u.EmployeeId, createdAt = u.CreatedAt, displayName = u.DisplayName, jobTitle = u.JobTitle })
         .ToListAsync();
     return Results.Ok(users);
 }).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
@@ -961,6 +961,157 @@ app.MapGet("/me/activity", async (ClaimsPrincipal principal, OrgMindDbContext db
     return Results.Ok(new { signIns = times });
 }).RequireAuthorization().RequireRateLimiting("user");
 
+// Profile picture: kept in the database and shown only to signed-in people, through these endpoints.
+app.MapGet("/me/avatar", async (HttpContext http, ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var avatar = await db.UserAvatars.AsNoTracking()
+        .FirstOrDefaultAsync(a => a.OrgId == me.OrgId && a.UserEmail == me.Email);
+    if (avatar is null) return Results.NoContent();
+
+    http.Response.Headers["X-Content-Type-Options"] = "nosniff";
+    http.Response.Headers["Cache-Control"] = "private, no-cache";
+    return Results.File(avatar.Data, avatar.ContentType);
+}).RequireAuthorization().RequireRateLimiting("user");
+
+app.MapPut("/me/avatar", async (HttpContext http, ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    if (http.Request.ContentLength is > AvatarRules.MaxBytes)
+        return Results.BadRequest(new { error = "The picture is too large." });
+
+    var data = await AvatarRules.ReadLimitedAsync(http.Request.Body);
+    if (data is null) return Results.BadRequest(new { error = "The picture is too large." });
+
+    var problem = AvatarRules.Check(data, out var contentType);
+    if (problem is not null) return Results.BadRequest(new { error = problem });
+
+    var row = await db.UserAvatars.FirstOrDefaultAsync(a => a.OrgId == me.OrgId && a.UserEmail == me.Email);
+    if (row is null)
+    {
+        db.UserAvatars.Add(new UserAvatar
+        {
+            OrgId = me.OrgId!, UserEmail = me.Email!, ContentType = contentType, Data = data, UpdatedAt = DateTime.UtcNow
+        });
+    }
+    else
+    {
+        row.ContentType = contentType;
+        row.Data = data;
+        row.UpdatedAt = DateTime.UtcNow;
+    }
+    await db.SaveChangesAsync();
+
+    await audit.LogAsync("AVATAR_CHANGED", me.Email, me.OrgId, new { });
+    return Results.Ok(new { saved = true });
+}).RequireAuthorization().RequireRateLimiting("user");
+
+app.MapDelete("/me/avatar", async (ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var row = await db.UserAvatars.FirstOrDefaultAsync(a => a.OrgId == me.OrgId && a.UserEmail == me.Email);
+    if (row is not null)
+    {
+        db.UserAvatars.Remove(row);
+        await db.SaveChangesAsync();
+        await audit.LogAsync("AVATAR_REMOVED", me.Email, me.OrgId, new { });
+    }
+    return Results.Ok(new { removed = true });
+}).RequireAuthorization().RequireRateLimiting("user");
+
+// ---- Departments: the administrator decides which departments exist -----------------
+
+app.MapGet("/admin/departments", async (ClaimsPrincipal user, OrgMindDbContext db) =>
+{
+    var orgId = user.FindFirst("orgId")?.Value;
+    if (string.IsNullOrEmpty(orgId)) return Results.Unauthorized();
+
+    await DepartmentOps.EnsureKnownAsync(db, orgId);
+    var names = await db.Departments.AsNoTracking()
+        .Where(d => d.OrgId == orgId).OrderBy(d => d.Name).Select(d => d.Name).ToListAsync();
+    var docs = await DepartmentOps.DocumentCountsAsync(db, orgId);
+
+    var list = new List<object>();
+    foreach (var n in names)
+    {
+        var u = await DepartmentOps.UsageAsync(db, orgId, n, docs.GetValueOrDefault(n));
+        list.Add(new { name = n, people = u.People, tickets = u.Tickets, forms = u.Forms, documents = u.Documents });
+    }
+    return Results.Ok(list);
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
+app.MapPost("/admin/departments", async (DepartmentNameRequest request, ClaimsPrincipal user, OrgMindDbContext db, IAuditService audit) =>
+{
+    var orgId = user.FindFirst("orgId")?.Value;
+    var admin = user.FindFirst("email")?.Value;
+    if (string.IsNullOrEmpty(orgId) || string.IsNullOrEmpty(admin)) return Results.Unauthorized();
+
+    var problem = DepartmentRules.Clean(request.Name, out var name);
+    if (problem is not null) return Results.BadRequest(new { error = problem });
+
+    var result = await DepartmentOps.AddAsync(db, orgId, name);
+    if (result.Status != 200) return Results.Json(new { error = result.Error }, statusCode: result.Status);
+
+    await audit.LogAsync("DEPARTMENT_ADDED", admin, orgId, new { name });
+    return Results.Ok(new { name });
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
+app.MapPatch("/admin/departments/{name}", async (string name, DepartmentRenameRequest request, ClaimsPrincipal user, OrgMindDbContext db, IAuditService audit) =>
+{
+    var orgId = user.FindFirst("orgId")?.Value;
+    var admin = user.FindFirst("email")?.Value;
+    if (string.IsNullOrEmpty(orgId) || string.IsNullOrEmpty(admin)) return Results.Unauthorized();
+
+    if (DepartmentRules.Clean(name, out var from) is not null) return Results.NotFound(new { error = "Department not found." });
+    var problem = DepartmentRules.Clean(request.NewName, out var to);
+    if (problem is not null) return Results.BadRequest(new { error = problem });
+
+    // People, forms, tickets, chat and documents are renamed together, or not at all.
+    await using var tx = await db.Database.BeginTransactionAsync();
+    var result = await DepartmentOps.RenameAsync(db, orgId, from, to);
+    if (result.Status != 200) return Results.Json(new { error = result.Error }, statusCode: result.Status);
+    await DepartmentOps.RelabelDocumentsAsync(db, orgId, from, to);
+    await tx.CommitAsync();
+
+    await audit.LogAsync("DEPARTMENT_RENAMED", admin, orgId, new { from, to, peopleMoved = result.PeopleMoved });
+    return Results.Ok(new { name = to, peopleMoved = result.PeopleMoved });
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
+app.MapDelete("/admin/departments/{name}", async (string name, string? moveTo, ClaimsPrincipal user, OrgMindDbContext db, IAuditService audit) =>
+{
+    var orgId = user.FindFirst("orgId")?.Value;
+    var admin = user.FindFirst("email")?.Value;
+    if (string.IsNullOrEmpty(orgId) || string.IsNullOrEmpty(admin)) return Results.Unauthorized();
+
+    if (DepartmentRules.Clean(name, out var from) is not null) return Results.NotFound(new { error = "Department not found." });
+    string? target = null;
+    if (!string.IsNullOrWhiteSpace(moveTo))
+    {
+        var problem = DepartmentRules.Clean(moveTo, out var cleanTarget);
+        if (problem is not null) return Results.BadRequest(new { error = problem });
+        target = cleanTarget;
+    }
+
+    var docs = await DepartmentOps.DocumentCountsAsync(db, orgId);
+    var docCount = docs.GetValueOrDefault(from);
+
+    await using var tx = await db.Database.BeginTransactionAsync();
+    var result = await DepartmentOps.DeleteAsync(db, orgId, from, target, docCount);
+    if (result.Status != 200) return Results.Json(new { error = result.Error, usage = result.Usage }, statusCode: result.Status);
+    if (docCount > 0 && target is not null)
+        await DepartmentOps.RelabelDocumentsAsync(db, orgId, from, target);
+    await tx.CommitAsync();
+
+    await audit.LogAsync("DEPARTMENT_DELETED", admin, orgId, new { name = from, moveTo = target, peopleMoved = result.PeopleMoved });
+    return Results.Ok(new { deleted = from, peopleMoved = result.PeopleMoved });
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
 // ---- Staff messages: direct and department groups ----------------------------------
 
 app.MapGet("/chat/directory", async (ClaimsPrincipal principal, OrgMindDbContext db) =>
@@ -972,9 +1123,45 @@ app.MapGet("/chat/directory", async (ClaimsPrincipal principal, OrgMindDbContext
     var people = await db.Users.AsNoTracking()
         .Where(u => u.OrgId == me.OrgId && (u.Role == "admin" || u.Role == "member") && u.Email != me.Email)
         .OrderBy(u => u.Email)
-        .Select(u => new { email = u.Email, role = u.Role, department = u.Department, employeeId = u.EmployeeId })
+        .Select(u => new
+        {
+            email = u.Email, role = u.Role, department = u.Department, employeeId = u.EmployeeId,
+            displayName = u.DisplayName, jobTitle = u.JobTitle
+        })
         .ToListAsync();
     return Results.Ok(people);
+}).RequireAuthorization().RequireRateLimiting("user");
+
+// A colleague's profile card. Staff only, own organization only, never a customer.
+app.MapGet("/staff/profile", async (string? email, ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+    if (!StaffProfiles.MayView(me)) return Results.StatusCode(403);
+
+    var person = await StaffProfiles.FindStaffAsync(db, me, email);
+    return person is null
+        ? Results.NotFound(new { error = "Person not found." })
+        : Results.Ok(StaffProfiles.CardOf(person));
+}).RequireAuthorization().RequireRateLimiting("user");
+
+// A colleague's profile picture, under the same rules. 204 means they have not set one.
+app.MapGet("/staff/avatar", async (string? email, HttpContext http, ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+    if (!StaffProfiles.MayView(me)) return Results.StatusCode(403);
+
+    var person = await StaffProfiles.FindStaffAsync(db, me, email);
+    if (person is null) return Results.NotFound(new { error = "Person not found." });
+
+    var avatar = await db.UserAvatars.AsNoTracking()
+        .FirstOrDefaultAsync(a => a.OrgId == me.OrgId && a.UserEmail == person.Email);
+    if (avatar is null) return Results.NoContent();
+
+    http.Response.Headers["X-Content-Type-Options"] = "nosniff";
+    http.Response.Headers["Cache-Control"] = "private, no-cache";
+    return Results.File(avatar.Data, avatar.ContentType);
 }).RequireAuthorization().RequireRateLimiting("user");
 
 app.MapGet("/chat/channels", async (ClaimsPrincipal principal, OrgMindDbContext db) =>

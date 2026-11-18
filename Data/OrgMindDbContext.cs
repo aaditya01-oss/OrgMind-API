@@ -26,6 +26,10 @@ public class OrgMindDbContext : DbContext
     public DbSet<StaffMessage> StaffMessages { get; set; }
     public DbSet<StaffRead> StaffReads { get; set; }
 
+    public DbSet<Department> Departments { get; set; }
+
+    public DbSet<UserAvatar> UserAvatars { get; set; }
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         modelBuilder.HasPostgresExtension("vector");
@@ -198,6 +202,28 @@ modelBuilder.Entity<Ticket>(entity =>
             entity.Property(e => e.UserEmail).HasColumnName("user_email");
             entity.Property(e => e.Channel).HasColumnName("channel");
             entity.Property(e => e.LastReadId).HasColumnName("last_read_id");
+        });
+
+        
+        modelBuilder.Entity<UserAvatar>(entity =>
+        {
+            entity.ToTable("user_avatars");
+            entity.HasKey(e => new { e.OrgId, e.UserEmail });
+            entity.Property(e => e.OrgId).HasColumnName("org_id");
+            entity.Property(e => e.UserEmail).HasColumnName("user_email");
+            entity.Property(e => e.ContentType).HasColumnName("content_type");
+            entity.Property(e => e.Data).HasColumnName("data");
+            entity.Property(e => e.UpdatedAt).HasColumnName("updated_at");
+        });
+
+        
+        modelBuilder.Entity<Department>(entity =>
+        {
+            entity.ToTable("departments");
+            entity.HasKey(e => new { e.OrgId, e.Name });
+            entity.Property(e => e.OrgId).HasColumnName("org_id");
+            entity.Property(e => e.Name).HasColumnName("name");
+            entity.Property(e => e.CreatedAt).HasColumnName("created_at");
         });
     }
 }

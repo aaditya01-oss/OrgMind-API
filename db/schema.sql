@@ -787,3 +787,19 @@ ALTER TABLE public.users
     ADD COLUMN IF NOT EXISTS job_title varchar(60),
     ADD COLUMN IF NOT EXISTS phone varchar(30),
     ADD COLUMN IF NOT EXISTS bio varchar(300);
+
+CREATE TABLE IF NOT EXISTS public.user_avatars (
+    org_id text NOT NULL,
+    user_email text NOT NULL,
+    content_type text NOT NULL,
+    data bytea NOT NULL CHECK (octet_length(data) <= 262144),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (org_id, user_email)
+);
+
+CREATE TABLE IF NOT EXISTS public.departments (
+    org_id text NOT NULL,
+    name text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (org_id, name)
+);

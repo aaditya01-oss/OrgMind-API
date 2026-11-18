@@ -766,3 +766,24 @@ ALTER TABLE ONLY public.invites
 --
 
 
+-- Thumbs up/down on assistant answers. A thumbs-up keeps no text; a thumbs-down keeps the
+-- question, part of the answer and an optional reason, readable by admins only.
+CREATE TABLE public.answer_feedback (
+    id serial PRIMARY KEY,
+    org_id text NOT NULL,
+    user_email text NOT NULL,
+    rating text NOT NULL CHECK (rating IN ('up', 'down')),
+    question text CHECK (question IS NULL OR char_length(question) <= 500),
+    answer text CHECK (answer IS NULL OR char_length(answer) <= 1500),
+    note text CHECK (note IS NULL OR char_length(note) <= 300),
+    status text NOT NULL DEFAULT 'new' CHECK (status IN ('new', 'handled')),
+    created_at timestamp without time zone NOT NULL DEFAULT (now() AT TIME ZONE 'utc')
+);
+
+CREATE INDEX answer_feedback_org ON public.answer_feedback USING btree (org_id, rating, status, created_at DESC);
+
+ALTER TABLE public.users
+    ADD COLUMN IF NOT EXISTS display_name varchar(60),
+    ADD COLUMN IF NOT EXISTS job_title varchar(60),
+    ADD COLUMN IF NOT EXISTS phone varchar(30),
+    ADD COLUMN IF NOT EXISTS bio varchar(300);

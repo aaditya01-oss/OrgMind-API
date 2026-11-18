@@ -912,7 +912,7 @@ app.MapPost("/threads/{kind}/{id:int}", async (string kind, int id, ThreadPostRe
     return Results.Ok(new { posted = true });
 }).RequireAuthorization().RequireRateLimiting("chat");
 
-// The signed-in person's own details.
+// The signed-in person's own profile. Role, department and employee ID can only be changed by an admin.
 app.MapGet("/me", async (ClaimsPrincipal principal, OrgMindDbContext db) =>
 {
     var me = Caller.From(principal);
@@ -921,14 +921,44 @@ app.MapGet("/me", async (ClaimsPrincipal principal, OrgMindDbContext db) =>
     var user = await db.Users.AsNoTracking().FirstOrDefaultAsync(u => u.Email == me.Email && u.OrgId == me.OrgId);
     if (user is null) return Results.NotFound(new { error = "Account not found." });
 
-    return Results.Ok(new
-    {
-        email = user.Email,
-        role = user.Role,
-        department = user.Department,
-        employeeId = user.EmployeeId,
-        orgId = user.OrgId
-    });
+    return Results.Ok(ProfileRules.View(user));
+}).RequireAuthorization().RequireRateLimiting("user");
+
+// Edit my own name, title, phone and bio. Nothing else can be changed here.
+app.MapPatch("/me", async (ProfileRequest request, ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var problem = ProfileRules.Validate(request, out var clean);
+    if (problem is not null) return Results.BadRequest(new { error = problem });
+
+    var user = await db.Users.FirstOrDefaultAsync(u => u.Email == me.Email && u.OrgId == me.OrgId);
+    if (user is null) return Results.NotFound(new { error = "Account not found." });
+
+    user.DisplayName = clean.DisplayName;
+    user.JobTitle = clean.JobTitle;
+    user.Phone = clean.Phone;
+    user.Bio = clean.Bio;
+    await db.SaveChangesAsync();
+
+    await audit.LogAsync("PROFILE_UPDATED", me.Email, me.OrgId, new { });   // no profile text in the log
+    return Results.Ok(ProfileRules.View(user));
+}).RequireAuthorization().RequireRateLimiting("user");
+
+// My own last sign-ins, so I can notice one that was not me.
+app.MapGet("/me/activity", async (ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var times = await db.AuditLogs.AsNoTracking()
+        .Where(a => a.OrgId == me.OrgId && a.UserId == me.Email && a.EventType == "LOGIN_SUCCESS")
+        .OrderByDescending(a => a.Timestamp)
+        .Take(8)
+        .Select(a => a.Timestamp)
+        .ToListAsync();
+    return Results.Ok(new { signIns = times });
 }).RequireAuthorization().RequireRateLimiting("user");
 
 // ---- Staff messages: direct and department groups ----------------------------------
@@ -1225,6 +1255,67 @@ app.MapPatch("/admin/company", async (CompanySettingsRequest request, ClaimsPrin
     await audit.LogAsync("COMPANY_SETTINGS_CHANGED", me.Email, me.OrgId,
         new { setting = "allow_customer_signup", from = before, to = org.AllowCustomerSignup });
     return Results.Ok(new { allowCustomerSignup = org.AllowCustomerSignup });
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
+// ---- Feedback on answers ------------------------------------------------------------------
+
+// Any signed-in person can rate an answer. A thumbs-up stores only the count.
+app.MapPost("/feedback", async (FeedbackRequest request, ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    if (!FeedbackRules.TryClean(request, out var rating, out var question, out var answer, out var note, out var error))
+        return Results.BadRequest(new { error });
+
+    db.AnswerFeedbacks.Add(new AnswerFeedback
+    {
+        OrgId = me.OrgId!, UserEmail = me.Email!, Rating = rating,
+        Question = question, Answer = answer, Note = note
+    });
+    await db.SaveChangesAsync();
+    return Results.Ok(new { saved = true });
+}).RequireAuthorization().RequireRateLimiting("user");
+
+// Admins: the thumbs-down list and the totals, for this company only.
+app.MapGet("/admin/feedback", async (string? status, ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var mine = db.AnswerFeedbacks.AsNoTracking().Where(f => f.OrgId == me.OrgId);
+    var up = await mine.CountAsync(f => f.Rating == "up");
+    var down = await mine.CountAsync(f => f.Rating == "down");
+    var open = await mine.CountAsync(f => f.Rating == "down" && f.Status == "new");
+
+    var list = mine.Where(f => f.Rating == "down");
+    if (status == "new" || status == "handled") list = list.Where(f => f.Status == status);
+
+    var items = await list.OrderByDescending(f => f.CreatedAt).ThenByDescending(f => f.Id).Take(200)
+        .Select(f => new { id = f.Id, user = f.UserEmail, question = f.Question, answer = f.Answer,
+                           note = f.Note, status = f.Status, createdAt = f.CreatedAt })
+        .ToListAsync();
+
+    return Results.Ok(new { up, down, open, items });
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
+app.MapPatch("/admin/feedback/{id:int}", async (int id, FeedbackStatusRequest request, ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var status = (request.Status ?? "").Trim().ToLowerInvariant();
+    if (status is not ("new" or "handled"))
+        return Results.BadRequest(new { error = "Status must be new or handled." });
+
+    var item = await db.AnswerFeedbacks.FirstOrDefaultAsync(f => f.Id == id && f.OrgId == me.OrgId);
+    if (item is null) return Results.NotFound(new { error = "Feedback not found." });
+
+    item.Status = status;
+    await db.SaveChangesAsync();
+
+    await audit.LogAsync("FEEDBACK_STATUS_CHANGED", me.Email, me.OrgId, new { feedbackId = id, to = status });
+    return Results.Ok(new { id, status });
 }).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
 
 // Admin: the knowledge base of THIS organization (the organization comes from the token).

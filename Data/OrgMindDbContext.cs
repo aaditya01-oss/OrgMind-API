@@ -13,6 +13,7 @@ public class OrgMindDbContext : DbContext
     public DbSet<DocumentChunk> DocumentChunks { get; set; }
     public DbSet<User> Users { get; set; }
     public DbSet<Organization> Organizations { get; set; }
+        public DbSet<AnswerFeedback> AnswerFeedbacks { get; set; }
     public DbSet<Invite> Invites { get; set; }
     public DbSet<AuditLog> AuditLogs { get; set; }
 
@@ -50,8 +51,27 @@ public class OrgMindDbContext : DbContext
             entity.Property(e => e.OrgId).HasColumnName("org_id");
             entity.Property(e => e.Role).HasColumnName("role");
             entity.Property(e => e.Department).HasColumnName("department");
+            entity.Property(e => e.DisplayName).HasColumnName("display_name");
+            entity.Property(e => e.JobTitle).HasColumnName("job_title");
+            entity.Property(e => e.Phone).HasColumnName("phone");
+            entity.Property(e => e.Bio).HasColumnName("bio");
             entity.Property(e => e.EmployeeId).HasColumnName("employee_id");
             entity.Property(e => e.CreatedAt).HasColumnName("created_at");
+        });
+
+            modelBuilder.Entity<AnswerFeedback>(entity =>
+        {
+            entity.ToTable("answer_feedback");
+            entity.HasKey(f => f.Id);
+            entity.Property(f => f.Id).HasColumnName("id");
+            entity.Property(f => f.OrgId).HasColumnName("org_id");
+            entity.Property(f => f.UserEmail).HasColumnName("user_email");
+            entity.Property(f => f.Rating).HasColumnName("rating");
+            entity.Property(f => f.Question).HasColumnName("question");
+            entity.Property(f => f.Answer).HasColumnName("answer");
+            entity.Property(f => f.Note).HasColumnName("note");
+            entity.Property(f => f.Status).HasColumnName("status");
+            entity.Property(f => f.CreatedAt).HasColumnName("created_at").HasDefaultValueSql("(now() AT TIME ZONE 'utc')");
         });
 
         modelBuilder.Entity<Organization>(entity =>

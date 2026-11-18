@@ -803,3 +803,14 @@ CREATE TABLE IF NOT EXISTS public.departments (
     created_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (org_id, name)
 );
+
+ALTER TABLE public.staff_messages
+    ADD COLUMN IF NOT EXISTS removed_at timestamptz,
+    ADD COLUMN IF NOT EXISTS removed_by text;
+
+CREATE TABLE IF NOT EXISTS public.staff_message_hidden (
+    org_id text NOT NULL,
+    user_email text NOT NULL,
+    message_id integer NOT NULL,
+    PRIMARY KEY (org_id, user_email, message_id)
+);

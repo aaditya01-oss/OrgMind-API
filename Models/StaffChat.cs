@@ -8,6 +8,8 @@ public class StaffMessage
     public string Author { get; set; } = string.Empty;
     public string Body { get; set; } = string.Empty;
     public DateTime CreatedAt { get; set; }
+        public DateTime? RemovedAt { get; set; }
+    public string? RemovedBy { get; set; }
 }
 
 // How far one person has read in one conversation.

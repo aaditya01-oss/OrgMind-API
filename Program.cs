@@ -417,6 +417,8 @@ app.MapPatch("/admin/users/{id:int}", async (int id, UpdateUserRequest request, 
     {
         var dept = request.Department.Trim().ToLowerInvariant();
         if (dept.Length > 100) return Results.BadRequest(new { error = "Department name is too long." });
+        if (dept.Length > 0 && dept != oldDepartment && !await DepartmentOps.ExistsAsync(db, orgId, dept))
+            return Results.BadRequest(new { error = "That department does not exist. Add it under Departments first." });
         target.Department = dept.Length == 0 ? null : dept;
     }
 
@@ -1280,6 +1282,38 @@ app.MapPost("/chat/department", async (ChatPostRequest request, ClaimsPrincipal 
     return Results.Ok(new { posted = true });
 }).RequireAuthorization().RequireRateLimiting("user");
 
+// Unsend / remove: take a message away for everyone. The author may always; an admin may in department groups.
+app.MapDelete("/chat/message/{id:int}", async (int id, ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit, LiveNotifier live) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var result = await StaffMessageActions.RemoveAsync(db, me, id);
+    if (result.Status != 200) return Results.Json(new { error = result.Error }, statusCode: result.Status);
+
+    if (result.Changed)
+    {
+        // Recorded: that a message was removed and by whom. Never the text.
+        await audit.LogAsync("STAFF_MESSAGE_REMOVED", me.Email, me.OrgId,
+            new { messageId = id, kind = result.Kind, byAdmin = result.ByAdmin });
+        if (result.Department is not null)
+            await live.ToDepartment(me.OrgId!, result.Department, me.Email!, new { area = "chat" });
+    }
+    return Results.Ok(new { removed = true });
+}).RequireAuthorization().RequireRateLimiting("user");
+
+// Delete for me: hide a message on my side only.
+app.MapPost("/chat/message/{id:int}/hide", async (int id, ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var result = await StaffMessageActions.HideAsync(db, me, id);
+    return result.Status == 200
+        ? Results.Ok(new { hidden = true })
+        : Results.Json(new { error = result.Error }, statusCode: result.Status);
+}).RequireAuthorization().RequireRateLimiting("user");
+
 // Fellow employees in my own department. Only email and employee ID are shown, and only inside my department.
 app.MapGet("/team", async (ClaimsPrincipal principal, OrgMindDbContext db) =>
 {
@@ -1292,7 +1326,7 @@ app.MapGet("/team", async (ClaimsPrincipal principal, OrgMindDbContext db) =>
     var members = await db.Users.AsNoTracking()
         .Where(u => u.OrgId == me.OrgId && u.Role == "member" && u.Department == me.Department)
         .OrderBy(u => u.EmployeeId).ThenBy(u => u.Email)
-        .Select(u => new { email = u.Email, employeeId = u.EmployeeId, isYou = u.Email == me.Email })
+        .Select(u => new { email = u.Email, employeeId = u.EmployeeId, isYou = u.Email == me.Email, displayName = u.DisplayName, jobTitle = u.JobTitle })
         .ToListAsync();
 
     return Results.Ok(new { department = me.Department, members });

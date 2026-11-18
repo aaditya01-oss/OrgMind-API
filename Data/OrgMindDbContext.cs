@@ -27,6 +27,7 @@ public class OrgMindDbContext : DbContext
     public DbSet<StaffRead> StaffReads { get; set; }
 
     public DbSet<Department> Departments { get; set; }
+        public DbSet<StaffHidden> HiddenMessages { get; set; }
 
     public DbSet<UserAvatar> UserAvatars { get; set; }
 
@@ -190,6 +191,8 @@ modelBuilder.Entity<Ticket>(entity =>
             entity.Property(e => e.Channel).HasColumnName("channel");
             entity.Property(e => e.Author).HasColumnName("author");
             entity.Property(e => e.Body).HasColumnName("body");
+            entity.Property(e => e.RemovedAt).HasColumnName("removed_at");
+            entity.Property(e => e.RemovedBy).HasColumnName("removed_by");
             entity.Property(e => e.CreatedAt).HasColumnName("created_at")
                   .HasDefaultValueSql("(NOW() AT TIME ZONE 'UTC')").ValueGeneratedOnAdd();
         });
@@ -224,6 +227,16 @@ modelBuilder.Entity<Ticket>(entity =>
             entity.Property(e => e.OrgId).HasColumnName("org_id");
             entity.Property(e => e.Name).HasColumnName("name");
             entity.Property(e => e.CreatedAt).HasColumnName("created_at");
+        });
+
+        
+        modelBuilder.Entity<StaffHidden>(entity =>
+        {
+            entity.ToTable("staff_message_hidden");
+            entity.HasKey(e => new { e.OrgId, e.UserEmail, e.MessageId });
+            entity.Property(e => e.OrgId).HasColumnName("org_id");
+            entity.Property(e => e.UserEmail).HasColumnName("user_email");
+            entity.Property(e => e.MessageId).HasColumnName("message_id");
         });
     }
 }

@@ -52,11 +52,13 @@ public static class StaffChat
         await db.SaveChangesAsync();
     }
 
-    // The latest 200 messages. Opening a conversation counts as reading it.
+        // The latest 200 messages. Opening a conversation counts as reading it.
+    // Messages I deleted "for me" are left out; removed messages arrive without their text.
     public static async Task<object> ReadAsync(OrgMindDbContext db, Caller me, string channel)
     {
         var messages = await db.StaffMessages.AsNoTracking()
-            .Where(m => m.OrgId == me.OrgId && m.Channel == channel)
+            .Where(m => m.OrgId == me.OrgId && m.Channel == channel
+                && !db.HiddenMessages.Any(h => h.OrgId == m.OrgId && h.UserEmail == me.Email && h.MessageId == m.Id))
             .OrderByDescending(m => m.Id).Take(200).ToListAsync();
         messages.Reverse();
 
@@ -64,13 +66,20 @@ public static class StaffChat
 
         return new
         {
-            messages = messages.Select(m => new
+            messages = messages.Select(m =>
             {
-                id = m.Id,
-                author = m.Author,
-                fromYou = m.Author == me.Email,
-                body = m.Body,
-                createdAt = m.CreatedAt
+                var removed = m.RemovedAt != null;
+                return new
+                {
+                    id = m.Id,
+                    author = m.Author,
+                    fromYou = m.Author == me.Email,
+                    body = removed ? "" : m.Body,
+                    createdAt = m.CreatedAt,
+                    removed,
+                    removedByAdmin = removed && m.RemovedBy != m.Author,
+                    canRemove = !removed && StaffMessageActions.CanRemove(me, m)
+                };
             })
         };
     }

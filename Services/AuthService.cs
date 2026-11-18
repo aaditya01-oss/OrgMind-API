@@ -185,14 +185,16 @@ public class AuthService : IAuthService
         var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secret));
         var credentials = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
 
-        var claims = new[]
+        var claims = new List<Claim>
         {
-            new Claim("userId", user.Id.ToString()),
-            new Claim("email", user.Email),
-            new Claim("orgId", user.OrgId),
-            new Claim("role", user.Role),
-            new Claim("department", user.Department ?? "")
+            new("userId", user.Id.ToString()),
+            new("email", user.Email),
+            new("orgId", user.OrgId),
+            new("role", user.Role),
+            new("department", user.Department ?? "")
         };
+        // After an administrator reset the password, this token can only be used to change it.
+        if (user.MustChangePassword) claims.Add(new Claim("pwdChange", "1"));
 
         var token = new JwtSecurityToken(
             claims: claims,

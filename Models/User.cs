@@ -13,5 +13,6 @@ public class User
     public string? Phone { get; set; }
     public string? Bio { get; set; }
     public string? EmployeeId { get; set; }
+    public bool MustChangePassword { get; set; }
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 }

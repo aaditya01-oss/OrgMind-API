@@ -814,3 +814,6 @@ CREATE TABLE IF NOT EXISTS public.staff_message_hidden (
     message_id integer NOT NULL,
     PRIMARY KEY (org_id, user_email, message_id)
 );
+
+ALTER TABLE public.users
+    ADD COLUMN IF NOT EXISTS must_change_password boolean NOT NULL DEFAULT false;

@@ -141,6 +141,26 @@ app.UseAuthentication();
 app.UseAuthorization();
 app.UseRateLimiter();
 
+
+// A token issued after an administrator reset a password may only be used to set a new one.
+app.Use(async (context, next) =>
+{
+    var restricted = context.User.Identity?.IsAuthenticated == true
+        && context.User.FindFirst("pwdChange")?.Value == "1";
+
+    if (restricted && !PasswordChangeGate.Allows(context.Request.Path.Value))
+    {
+        context.Response.StatusCode = StatusCodes.Status403Forbidden;
+        await context.Response.WriteAsJsonAsync(new
+        {
+            error = "You must set a new password first.",
+            code = "password_change_required"
+        });
+        return;
+    }
+    await next();
+});
+
 app.MapGet("/", () => "OrgMind API is running!");
 
 app.MapGet("/health", () => new {
@@ -1350,12 +1370,37 @@ app.MapPost("/me/password", async (ChangePasswordRequest request, ClaimsPrincipa
         return Results.BadRequest(new { error = "The current password is not correct." });
 
     user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(next);
+    user.MustChangePassword = false;
     await db.SaveChangesAsync();
 
     // The audit log records that it happened, never any password.
     await audit.LogAsync("PASSWORD_CHANGED", me.Email, me.OrgId, new { });
     return Results.Ok(new { changed = true });
 }).RequireAuthorization().RequireRateLimiting("auth");
+
+// Admin: give someone a temporary password. It is shown once and they must change it at sign-in.
+app.MapPost("/admin/users/{id:int}/reset-password", async (int id, ClaimsPrincipal user, OrgMindDbContext db, IAuditService audit) =>
+{
+    var orgId = user.FindFirst("orgId")?.Value;
+    var adminEmail = user.FindFirst("email")?.Value;
+    if (string.IsNullOrEmpty(orgId) || string.IsNullOrEmpty(adminEmail)) return Results.Unauthorized();
+
+    var target = await db.Users.FirstOrDefaultAsync(u => u.Id == id && u.OrgId == orgId);
+    if (target is null) return Results.NotFound(new { error = "User not found." });
+    if (target.Email == adminEmail)
+        return Results.BadRequest(new { error = "Use My profile to change your own password." });
+    if (target.Role == "customer")
+        return Results.BadRequest(new { error = "Customer passwords cannot be reset here yet." });
+
+    var temporary = TemporaryPassword.Generate();
+    target.PasswordHash = BCrypt.Net.BCrypt.HashPassword(temporary);
+    target.MustChangePassword = true;
+    await db.SaveChangesAsync();
+
+    // The audit log records who reset whose password (by id). Never any password.
+    await audit.LogAsync("PASSWORD_RESET_BY_ADMIN", adminEmail, orgId, new { targetUserId = id }, "WARNING");
+    return Results.Ok(new { email = target.Email, temporaryPassword = temporary });
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("auth");
 
 // ---- Admin: manage form templates --------------------------------------------------
 

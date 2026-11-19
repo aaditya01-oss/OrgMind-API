@@ -63,6 +63,7 @@ public class OrgMindDbContext : DbContext
             entity.Property(e => e.EmployeeId).HasColumnName("employee_id");
             entity.Property(e => e.CreatedAt).HasColumnName("created_at");
             entity.Property(e => e.MustChangePassword).HasColumnName("must_change_password");
+                        entity.Property(e => e.TokenVersion).HasColumnName("token_version");
         });
 
             modelBuilder.Entity<AnswerFeedback>(entity =>

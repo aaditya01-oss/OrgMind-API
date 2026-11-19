@@ -14,5 +14,7 @@ public class User
     public string? Bio { get; set; }
     public string? EmployeeId { get; set; }
     public bool MustChangePassword { get; set; }
+
+        public int TokenVersion { get; set; }
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
 }

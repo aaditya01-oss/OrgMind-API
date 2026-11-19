@@ -94,7 +94,11 @@ public static class DepartmentOps
     private static async Task<int> ReassignAsync(OrgMindDbContext db, string orgId, string from, string to)
     {
         var users = await db.Users.Where(u => u.OrgId == orgId && u.Department == from).ToListAsync();
-        foreach (var u in users) u.Department = to;
+                foreach (var u in users)
+        {
+            u.Department = to;
+            u.TokenVersion++;   // their old sign-in carries the old department name
+        }
 
         foreach (var i in await db.Invites.Where(i => i.OrgId == orgId && i.Department == from).ToListAsync())
             i.Department = to;

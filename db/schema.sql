@@ -817,3 +817,6 @@ CREATE TABLE IF NOT EXISTS public.staff_message_hidden (
 
 ALTER TABLE public.users
     ADD COLUMN IF NOT EXISTS must_change_password boolean NOT NULL DEFAULT false;
+
+ALTER TABLE public.users
+    ADD COLUMN IF NOT EXISTS token_version integer NOT NULL DEFAULT 0;

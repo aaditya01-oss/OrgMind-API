@@ -142,6 +142,38 @@ app.UseAuthorization();
 app.UseRateLimiter();
 
 
+// Ends old sign-ins: a password change or reset adds 1 to the person's counter,
+// so every token issued before that stops working immediately.
+app.Use(async (context, next) =>
+{
+    if (context.User.Identity?.IsAuthenticated == true)
+    {
+        var idOk = int.TryParse(context.User.FindFirst("userId")?.Value, out var userId);
+        var tokenVersion = SessionRevocation.ReadVersion(context.User.FindFirst("tv")?.Value);
+
+        int? current = null;
+        if (idOk)
+        {
+            var db = context.RequestServices.GetRequiredService<OrgMindDbContext>();
+            current = await db.Users.AsNoTracking()
+                .Where(u => u.Id == userId)
+                .Select(u => (int?)u.TokenVersion)
+                .FirstOrDefaultAsync();
+        }
+
+        if (!SessionRevocation.IsStillValid(current, tokenVersion))
+        {
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+            await context.Response.WriteAsJsonAsync(new
+            {
+                error = "Your session has ended. Please sign in again.",
+                code = "session_ended"
+            });
+            return;
+        }
+    }
+    await next();
+});
 // A token issued after an administrator reset a password may only be used to set a new one.
 app.Use(async (context, next) =>
 {
@@ -469,7 +501,12 @@ app.MapPatch("/admin/users/{id:int}", async (int id, UpdateUserRequest request, 
         target.EmployeeId = await EmployeeIds.NextAsync(db, orgId);
     }
 
+        // A changed role or department must apply at once, not at the person's next sign-in.
+    if (target.Role != oldRole || target.Department != oldDepartment)
+        target.TokenVersion++;
+
     await db.SaveChangesAsync();
+    
     await audit.LogAsync("USER_UPDATED", adminEmail, orgId,
         new
         {
@@ -1371,6 +1408,7 @@ app.MapPost("/me/password", async (ChangePasswordRequest request, ClaimsPrincipa
 
     user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(next);
     user.MustChangePassword = false;
+    user.TokenVersion++;   // every older sign-in of this person stops working
     await db.SaveChangesAsync();
 
     // The audit log records that it happened, never any password.
@@ -1395,6 +1433,7 @@ app.MapPost("/admin/users/{id:int}/reset-password", async (int id, ClaimsPrincip
     var temporary = TemporaryPassword.Generate();
     target.PasswordHash = BCrypt.Net.BCrypt.HashPassword(temporary);
     target.MustChangePassword = true;
+    target.TokenVersion++;   // the old sign-ins of this person end right now
     await db.SaveChangesAsync();
 
     // The audit log records who reset whose password (by id). Never any password.

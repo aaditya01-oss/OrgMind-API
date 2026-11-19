@@ -191,7 +191,8 @@ public class AuthService : IAuthService
             new("email", user.Email),
             new("orgId", user.OrgId),
             new("role", user.Role),
-            new("department", user.Department ?? "")
+            new("department", user.Department ?? ""),
+            new("tv", user.TokenVersion.ToString()),
         };
         // After an administrator reset the password, this token can only be used to change it.
         if (user.MustChangePassword) claims.Add(new Claim("pwdChange", "1"));

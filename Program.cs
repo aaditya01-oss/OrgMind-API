@@ -588,6 +588,44 @@ app.MapGet("/admin/overview", async (ClaimsPrincipal user, OrgMindDbContext db) 
     return Results.Ok(new { usersByRole, newUsers, departments, ticketsByStatus, openByDepartment, upsetOpen, recent });
 }).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
 
+// ---- Admin: the access review (ComplianceBot lite) -----------------------------------
+
+app.MapGet("/admin/compliance/access-review", async (DateTime? from, DateTime? to, ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var orgId = principal.FindFirst("orgId")?.Value;
+    if (string.IsNullOrEmpty(orgId)) return Results.Unauthorized();
+    return Results.Ok(await AccessReview.BuildAsync(db, orgId, from, to));
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
+app.MapGet("/admin/compliance/export", async (string section, DateTime? from, DateTime? to,
+    ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit) =>
+{
+    var orgId = principal.FindFirst("orgId")?.Value;
+    var email = principal.FindFirst("email")?.Value;
+    if (string.IsNullOrEmpty(orgId) || string.IsNullOrEmpty(email)) return Results.Unauthorized();
+
+    var report = await AccessReview.BuildAsync(db, orgId, from, to);
+    var found = report.Sections.FirstOrDefault(s => s.Key == section);
+    if (found is null) return Results.NotFound(new { error = "Unknown section." });
+
+    // Taking this list out of the system is itself recorded.
+    await audit.LogAsync("ACCESS_REVIEW_EXPORTED", email, orgId, new { section = found.Key, rows = found.Rows.Count });
+    return Results.File(Encoding.UTF8.GetBytes(AccessReview.ToCsv(found)), "text/csv", $"access-review-{found.Key}.csv");
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
+// "Mark as reviewed": the evidence that a person really looked at this report.
+app.MapPost("/admin/compliance/reviewed", async (ReviewedRequest request, ClaimsPrincipal principal, IAuditService audit) =>
+{
+    var orgId = principal.FindFirst("orgId")?.Value;
+    var email = principal.FindFirst("email")?.Value;
+    if (string.IsNullOrEmpty(orgId) || string.IsNullOrEmpty(email)) return Results.Unauthorized();
+
+    var (start, end) = AccessReview.Range(request.From, request.To, DateTime.UtcNow);
+    await audit.LogAsync("ACCESS_REVIEWED", email, orgId,
+        new { from = start.ToString("yyyy-MM-dd"), to = end.AddDays(-1).ToString("yyyy-MM-dd") });
+    return Results.Ok(new { reviewed = true });
+}).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
+
 // ---- Admin: the audit log ------------------------------------------------------------
 
 app.MapGet("/admin/audit", async (string? type, string? user, DateTime? from, DateTime? to, bool? warnings, int? page,

@@ -17,6 +17,10 @@ var jwtSecret = builder.Configuration["JwtSecret"];
 if (string.IsNullOrWhiteSpace(jwtSecret) || jwtSecret.Length < 32)
     throw new InvalidOperationException("JwtSecret must be set and at least 32 characters long.");
 
+
+// The key that scrambles sensitive form answers. The API refuses to start without a valid one.
+builder.Services.AddSingleton(new FieldProtector(FieldEncryption.ParseKey(builder.Configuration["DataEncryptionKey"])));
+
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddHttpClient<IChatService, ChatService>();
 builder.Services.AddHttpClient<IDocumentService, DocumentService>();
@@ -301,7 +305,7 @@ app.MapPost("/auth/register-org", async (CreateOrgRequest request, IAuthService 
     return Results.Ok(new AuthResponse { Token = result.Token!, Email = email, OrgId = result.OrgId!, Role = result.Role! });
 }).RequireRateLimiting("auth");
 
-app.MapPost("/orgs/invites", async (CreateInviteRequest request, ClaimsPrincipal user, IAuthService authService, IAuditService audit) =>
+app.MapPost("/orgs/invites", async (CreateInviteRequest request, ClaimsPrincipal user, IAuthService authService, IAuditService audit, OrgMindDbContext db) =>
 {
     var orgId = user.FindFirst("orgId")?.Value;
     var email = user.FindFirst("email")?.Value;
@@ -313,6 +317,11 @@ app.MapPost("/orgs/invites", async (CreateInviteRequest request, ClaimsPrincipal
     if (string.IsNullOrEmpty(department)) department = null;
     if (department is not null && department.Length > 100)
         return Results.BadRequest(new { error = "Department name is too long." });
+    if (department is not null)
+    {
+        var unknown = await DepartmentOps.CheckKnownAsync(db, orgId, department);
+        if (unknown is not null) return Results.BadRequest(new { error = unknown });
+    }
     var (code, expiresAt) = await authService.CreateInviteAsync(orgId, role, email, department);
 
     // Log that an invite was made, but never the code itself: it is a secret.
@@ -588,6 +597,59 @@ app.MapGet("/admin/overview", async (ClaimsPrincipal user, OrgMindDbContext db) 
     return Results.Ok(new { usersByRole, newUsers, departments, ticketsByStatus, openByDepartment, upsetOpen, recent });
 }).RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("user");
 
+// ---- Hand a ticket or form request to another department (InterLink lite) ------------
+
+app.MapPost("/handover/{kind}/{id:int}", async (string kind, int id, HandoverRequest request,
+    ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit, LiveNotifier live) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var r = await HandoverOps.HandOverAsync(db, me, kind, id, request.ToDepartment, request.Reason);
+    if (r.Status != 200) return Results.Json(new { error = r.Error }, statusCode: r.Status);
+
+    // The audit log records which item moved where. The reason text stays in the staff-only history.
+    await audit.LogAsync("HANDED_OVER", me.Email, me.OrgId, new { kind, refId = id, from = r.From, to = r.To });
+
+    var payload = new { area = "thread", kind, id };
+    await live.ToDepartment(me.OrgId!, r.To!, me.Email!, payload);
+    if (!string.IsNullOrEmpty(r.From)) await live.ToDepartment(me.OrgId!, r.From, me.Email!, payload);
+
+    return Results.Ok(new { id, department = r.To });
+}).RequireAuthorization().RequireRateLimiting("user");
+
+// The department list for the hand-over picker. Staff only (the admin list is admin-only).
+app.MapGet("/staff/departments", async (ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+    if (!StaffChat.IsStaff(me)) return Results.StatusCode(403);
+
+    await DepartmentOps.EnsureKnownAsync(db, me.OrgId!);
+    var names = await db.Departments.AsNoTracking()
+        .Where(d => d.OrgId == me.OrgId).OrderBy(d => d.Name).Select(d => d.Name).ToListAsync();
+    return Results.Ok(names);
+}).RequireAuthorization().RequireRateLimiting("user");
+
+// The hand-over history of one item. Staff only: the customer never sees it.
+app.MapGet("/handover/{kind}/{id:int}", async (string kind, int id, ClaimsPrincipal principal, OrgMindDbContext db) =>
+{
+    var me = Caller.From(principal);
+    if (!me.IsKnown) return Results.Unauthorized();
+
+    var access = await Threads.OpenAsync(db, me, kind, id);
+    if (access is null || !access.IsStaff) return Results.NotFound(new { error = "Not found." });
+
+    var rows = await db.Handovers.AsNoTracking()
+        .Where(h => h.OrgId == me.OrgId && h.Kind == kind && h.RefId == id)
+        .OrderBy(h => h.Id).ToListAsync();
+
+    return Results.Ok(rows.Select(h => new
+    {
+        id = h.Id, from = h.FromDepartment, to = h.ToDepartment, reason = h.Reason, by = h.HandedBy, at = h.CreatedAt
+    }));
+}).RequireAuthorization().RequireRateLimiting("user");
+
 // ---- Admin: the access review (ComplianceBot lite) -----------------------------------
 
 app.MapGet("/admin/compliance/access-review", async (DateTime? from, DateTime? to, ClaimsPrincipal principal, OrgMindDbContext db) =>
@@ -715,7 +777,7 @@ app.MapGet("/forms", async (ClaimsPrincipal principal, OrgMindDbContext db) =>
 }).RequireAuthorization().RequireRateLimiting("user");
 
 // Submit a form. The server re-checks every answer and routes it to the form's department.
-app.MapPost("/forms/{id:int}/submit", async (int id, FormSubmitRequest request, ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit) =>
+app.MapPost("/forms/{id:int}/submit", async (int id, FormSubmitRequest request, ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit, FieldProtector protector) =>
 {
     var me = Caller.From(principal);
     if (!me.IsKnown) return Results.Unauthorized();
@@ -734,7 +796,7 @@ app.MapPost("/forms/{id:int}/submit", async (int id, FormSubmitRequest request, 
         TemplateName = form.Name,
         SubmittedBy = me.Email,
         Department = form.Department,
-        Data = cleaned
+        Data = AnswerProtection.Protect(form.Fields, cleaned, protector, me.OrgId!)
     };
     db.FormSubmissions.Add(submission);
     await db.SaveChangesAsync();
@@ -775,7 +837,7 @@ app.MapGet("/submissions", async (ClaimsPrincipal principal, OrgMindDbContext db
 }).RequireAuthorization().RequireRateLimiting("user");
 
 // One submission with its answers. Opening someone else's is recorded in the audit log.
-app.MapGet("/submissions/{id:int}", async (int id, ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit) =>
+app.MapGet("/submissions/{id:int}", async (int id, ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit, FieldProtector protector) =>
 {
     var me = Caller.From(principal);
     if (!me.IsKnown) return Results.Unauthorized();
@@ -793,7 +855,7 @@ app.MapGet("/submissions/{id:int}", async (int id, ClaimsPrincipal principal, Or
         // Sensitive answers are blanked for everyone except the person who sent them.
     // The values only leave the server through the audited "reveal" endpoint below.
     var fieldsJson = JsonSerializer.Deserialize<JsonElement>(form?.Fields ?? "[]");
-    var answers = JsonSerializer.Deserialize<Dictionary<string, string>>(s.Data) ?? new Dictionary<string, string>();
+    var answers = AnswerProtection.ReadAll(s.Data, form?.Fields, protector, me.OrgId!);
     var masked = new List<string>();
     if (s.SubmittedBy != me.Email && fieldsJson.ValueKind == JsonValueKind.Array)
     {
@@ -829,7 +891,7 @@ app.MapGet("/submissions/{id:int}", async (int id, ClaimsPrincipal principal, Or
 
 
 // Show one sensitive answer. Only an admin or the handling department, and every reveal is recorded.
-app.MapPost("/submissions/{id:int}/reveal", async (int id, RevealRequest request, ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit) =>
+app.MapPost("/submissions/{id:int}/reveal", async (int id, RevealRequest request, ClaimsPrincipal principal, OrgMindDbContext db, IAuditService audit, FieldProtector protector) =>
 {
     var me = Caller.From(principal);
     if (!me.IsKnown) return Results.Unauthorized();
@@ -855,7 +917,7 @@ app.MapPost("/submissions/{id:int}/reveal", async (int id, RevealRequest request
         }
     }
 
-    var answers = JsonSerializer.Deserialize<Dictionary<string, string>>(s.Data) ?? new Dictionary<string, string>();
+        var answers = AnswerProtection.ReadAll(s.Data, form?.Fields, protector, me.OrgId!);
     if (!isSensitive || !answers.TryGetValue(key, out var value))
         return Results.NotFound(new { error = "Answer not found." });
 
@@ -1521,6 +1583,9 @@ app.MapPost("/admin/forms", async (FormTemplateRequest request, ClaimsPrincipal 
                                        out var department, out var fieldsJson, out var error))
         return Results.BadRequest(new { error });
 
+    var unknownDepartment = await DepartmentOps.CheckKnownAsync(db, me.OrgId!, department);
+    if (unknownDepartment is not null) return Results.BadRequest(new { error = unknownDepartment });
+
     var form = new FormTemplate
     {
         OrgId = me.OrgId!,
@@ -1551,6 +1616,13 @@ app.MapPut("/admin/forms/{id:int}", async (int id, FormTemplateRequest request, 
     if (!FormRules.TryValidateTemplate(request, out var name, out var description, out var audience,
                                        out var department, out var fieldsJson, out var error))
         return Results.BadRequest(new { error });
+
+    // Saving a form that already uses its department unchanged must keep working.
+    if (!string.Equals(department, form.Department, StringComparison.OrdinalIgnoreCase))
+    {
+        var unknownDepartment = await DepartmentOps.CheckKnownAsync(db, me.OrgId!, department);
+        if (unknownDepartment is not null) return Results.BadRequest(new { error = unknownDepartment });
+    }
 
     form.Name = name;
     form.Description = description;
@@ -1713,7 +1785,7 @@ app.MapGet("/library", async (ClaimsPrincipal principal, IDocumentService docs) 
     return Results.Ok(items.OrderBy(i => ((dynamic)i).name));
 }).RequireAuthorization().RequireRateLimiting("user");
 
-app.MapPost("/admin/documents/relabel", async (DocLabelRequest request, ClaimsPrincipal user, IDocumentService docs) =>
+app.MapPost("/admin/documents/relabel", async (DocLabelRequest request, ClaimsPrincipal user, IDocumentService docs, OrgMindDbContext db) =>
 {
     var orgId = user.FindFirst("orgId")?.Value;
     var email = user.FindFirst("email")?.Value;
@@ -1729,8 +1801,13 @@ app.MapPost("/admin/documents/relabel", async (DocLabelRequest request, ClaimsPr
         return Results.BadRequest(new { error = "Invalid visibility choice." });
     if (visibility == "department" && department.Length == 0)
         return Results.BadRequest(new { error = "Choose a department for a department-only document." });
-    if (department.Length > 100)
+     if (department.Length > 100)
         return Results.BadRequest(new { error = "Department name is too long." });
+    if (visibility == "department")
+    {
+        var unknown = await DepartmentOps.CheckKnownAsync(db, orgId, department);
+        if (unknown is not null) return Results.BadRequest(new { error = unknown });
+    }
 
     var (status, body) = await docs.RelabelAsync(orgId, docName, visibility, department.Length == 0 ? null : department, email);
     return EngineResult(status, body, "The document service could not change the label.");
@@ -1752,7 +1829,7 @@ app.MapPost("/admin/documents/delete", async (DocDeleteRequest request, ClaimsPr
 
 const long MaxUploadBytes = 20 * 1024 * 1024;
 
-async Task<IResult> HandleUpload(HttpRequest http, ClaimsPrincipal user, IDocumentService docs, string route, string[] allowed)
+async Task<IResult> HandleUpload(HttpRequest http, ClaimsPrincipal user, IDocumentService docs, OrgMindDbContext db, string route, string[] allowed)
 {
         // Identity comes from the verified token, never from the browser.
     var orgId = user.FindFirst("orgId")?.Value;
@@ -1786,6 +1863,11 @@ async Task<IResult> HandleUpload(HttpRequest http, ClaimsPrincipal user, IDocume
     if (department.Length > 100)
         return Results.BadRequest(new { error = "Department name is too long." });
     if (visibility != "department") department = "";
+        if (visibility == "department")
+    {
+        var unknown = await DepartmentOps.CheckKnownAsync(db, orgId, department);
+        if (unknown is not null) return Results.BadRequest(new { error = unknown });
+    }
 
     var (status, body) = await docs.ForwardAsync(route, file, orgId, email, docName, visibility, department);
 
@@ -1810,12 +1892,12 @@ async Task<IResult> HandleUpload(HttpRequest http, ClaimsPrincipal user, IDocume
     return Results.Content(body, "application/json");
 }
 
-app.MapPost("/documents/train", (HttpRequest http, ClaimsPrincipal user, IDocumentService docs) =>
-    HandleUpload(http, user, docs, "/documents/train", new[] { ".pdf", ".docx", ".txt" }))
+app.MapPost("/documents/train", (HttpRequest http, ClaimsPrincipal user, IDocumentService docs, OrgMindDbContext db) =>
+    HandleUpload(http, user, docs, db, "/documents/train", new[] { ".pdf", ".docx", ".txt" }))
     .RequireAuthorization(p => p.RequireRole("admin")).RequireRateLimiting("chat");
 
-app.MapPost("/documents/ocr", (HttpRequest http, ClaimsPrincipal user, IDocumentService docs) =>
-    HandleUpload(http, user, docs, "/documents/ocr", new[] { ".pdf", ".png", ".jpg", ".jpeg" }))
+app.MapPost("/documents/ocr", (HttpRequest http, ClaimsPrincipal user, IDocumentService docs, OrgMindDbContext db) =>
+    HandleUpload(http, user, docs, db, "/documents/ocr", new[] { ".pdf", ".png", ".jpg", ".jpeg" }))
     .RequireAuthorization().RequireRateLimiting("chat");
 
 app.MapHub<LiveHub>("/hubs/live").RequireAuthorization();

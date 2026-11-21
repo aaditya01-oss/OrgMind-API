@@ -820,3 +820,16 @@ ALTER TABLE public.users
 
 ALTER TABLE public.users
     ADD COLUMN IF NOT EXISTS token_version integer NOT NULL DEFAULT 0;
+
+    CREATE TABLE IF NOT EXISTS public.handovers (
+    id serial PRIMARY KEY,
+    org_id varchar(100) NOT NULL,
+    kind text NOT NULL CHECK (kind IN ('ticket','submission')),
+    ref_id integer NOT NULL,
+    from_department varchar(100),
+    to_department varchar(100) NOT NULL,
+    reason text NOT NULL CHECK (char_length(reason) BETWEEN 5 AND 300),
+    handed_by varchar(255) NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS handovers_ref ON public.handovers (org_id, kind, ref_id, id);

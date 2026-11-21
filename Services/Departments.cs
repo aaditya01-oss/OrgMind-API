@@ -45,6 +45,21 @@ public static class DepartmentOps
     public static Task<bool> ExistsAsync(OrgMindDbContext db, string orgId, string name) =>
         db.Departments.AsNoTracking().AnyAsync(d => d.OrgId == orgId && d.Name == name);
 
+        // null = fine. An empty name means "no department" and is fine.
+    // Otherwise the department must exist. Names already in use somewhere (older data) are added first,
+    // so a real, older department is never refused by mistake.
+    public static async Task<string?> CheckKnownAsync(OrgMindDbContext db, string orgId, string? name)
+    {
+        var clean = (name ?? "").Trim().ToLowerInvariant();
+        if (clean.Length == 0) return null;
+        if (await ExistsAsync(db, orgId, clean)) return null;
+
+        await EnsureKnownAsync(db, orgId);
+        return await ExistsAsync(db, orgId, clean)
+            ? null
+            : "That department does not exist. Add it under Departments first.";
+    }
+
     // Departments already used somewhere (older data) are added to the list, so nothing is invisible.
     public static async Task EnsureKnownAsync(OrgMindDbContext db, string orgId)
     {

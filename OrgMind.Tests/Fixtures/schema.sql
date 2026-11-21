@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict DLha7F62iheodAFfU9GVp3gR8OxjgqTo5BOy3waziSG2ZdKOINbt0YgjMWWXVwn
+\restrict tdrehezFCCLbsfYgnhIeFIvqPuqdTln2ze9DZoGc2ytbpaw2dTToKmeKh7UqjqO
 
 -- Dumped from database version 16.15 (Debian 16.15-1.pgdg12+2)
 -- Dumped by pg_dump version 16.15 (Debian 16.15-1.pgdg12+2)
@@ -290,6 +290,45 @@ CREATE SEQUENCE public.form_templates_id_seq
 --
 
 ALTER SEQUENCE public.form_templates_id_seq OWNED BY public.form_templates.id;
+
+
+--
+-- Name: handovers; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.handovers (
+    id integer NOT NULL,
+    org_id character varying(100) NOT NULL,
+    kind text NOT NULL,
+    ref_id integer NOT NULL,
+    from_department character varying(100),
+    to_department character varying(100) NOT NULL,
+    reason text NOT NULL,
+    handed_by character varying(255) NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT handovers_kind_check CHECK ((kind = ANY (ARRAY['ticket'::text, 'submission'::text]))),
+    CONSTRAINT handovers_reason_check CHECK (((char_length(reason) >= 5) AND (char_length(reason) <= 300)))
+);
+
+
+--
+-- Name: handovers_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.handovers_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: handovers_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.handovers_id_seq OWNED BY public.handovers.id;
 
 
 --
@@ -593,6 +632,13 @@ ALTER TABLE ONLY public.form_templates ALTER COLUMN id SET DEFAULT nextval('publ
 
 
 --
+-- Name: handovers id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.handovers ALTER COLUMN id SET DEFAULT nextval('public.handovers_id_seq'::regclass);
+
+
+--
 -- Name: staff_messages id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -689,6 +735,14 @@ ALTER TABLE ONLY public.form_submissions
 
 ALTER TABLE ONLY public.form_templates
     ADD CONSTRAINT form_templates_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: handovers handovers_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.handovers
+    ADD CONSTRAINT handovers_pkey PRIMARY KEY (id);
 
 
 --
@@ -795,6 +849,13 @@ CREATE INDEX answer_feedback_org ON public.answer_feedback USING btree (org_id, 
 
 
 --
+-- Name: handovers_ref; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX handovers_ref ON public.handovers USING btree (org_id, kind, ref_id, id);
+
+
+--
 -- Name: idx_audit_org_time; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -891,5 +952,5 @@ ALTER TABLE ONLY public.invites
 -- PostgreSQL database dump complete
 --
 
-\unrestrict DLha7F62iheodAFfU9GVp3gR8OxjgqTo5BOy3waziSG2ZdKOINbt0YgjMWWXVwn
+\unrestrict tdrehezFCCLbsfYgnhIeFIvqPuqdTln2ze9DZoGc2ytbpaw2dTToKmeKh7UqjqO
 

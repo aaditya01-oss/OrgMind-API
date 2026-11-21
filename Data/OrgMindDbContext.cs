@@ -31,6 +31,8 @@ public class OrgMindDbContext : DbContext
 
     public DbSet<UserAvatar> UserAvatars { get; set; }
 
+        public DbSet<Handover> Handovers { get; set; }
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
         modelBuilder.HasPostgresExtension("vector");
@@ -239,6 +241,22 @@ modelBuilder.Entity<Ticket>(entity =>
             entity.Property(e => e.OrgId).HasColumnName("org_id");
             entity.Property(e => e.UserEmail).HasColumnName("user_email");
             entity.Property(e => e.MessageId).HasColumnName("message_id");
+        });
+
+        
+        modelBuilder.Entity<Handover>(entity =>
+        {
+            entity.ToTable("handovers");
+            entity.HasKey(e => e.Id);
+            entity.Property(e => e.Id).HasColumnName("id");
+            entity.Property(e => e.OrgId).HasColumnName("org_id");
+            entity.Property(e => e.Kind).HasColumnName("kind");
+            entity.Property(e => e.RefId).HasColumnName("ref_id");
+            entity.Property(e => e.FromDepartment).HasColumnName("from_department");
+            entity.Property(e => e.ToDepartment).HasColumnName("to_department");
+            entity.Property(e => e.Reason).HasColumnName("reason");
+            entity.Property(e => e.HandedBy).HasColumnName("handed_by");
+            entity.Property(e => e.CreatedAt).HasColumnName("created_at");
         });
     }
 }

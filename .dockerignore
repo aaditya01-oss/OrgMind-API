@@ -1,0 +1,7 @@
+**/bin
+**/obj
+OrgMind.Tests
+.git
+.vs
+.vscode
+appsettings.Development.json
